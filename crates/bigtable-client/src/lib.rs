@@ -1,4 +1,31 @@
-#![doc = include_str!("../../../README.md")]
+//! An async Rust client for Google Cloud Bigtable.
+//!
+//! M0 provides configuration, application default credentials, pooled Tonic
+//! channels, emulator support, and access to the generated Bigtable client.
+//!
+//! # Quick start
+//!
+//! ```no_run
+//! use bigtable_client::{Client, ClientConfig, proto::PingAndWarmRequest};
+//! use tonic::Request;
+//!
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let config = ClientConfig::new("my-project", "my-instance")?;
+//! let client = Client::connect(config).await?;
+//! let mut raw = client.raw_client();
+//!
+//! let mut request = Request::new(PingAndWarmRequest {
+//!     name: "projects/my-project/instances/my-instance".to_owned(),
+//!     app_profile_id: "default".to_owned(),
+//! });
+//! request.metadata_mut().insert(
+//!     "x-goog-request-params",
+//!     "name=projects/my-project/instances/my-instance".parse()?,
+//! );
+//! raw.ping_and_warm(request).await?;
+//! # Ok(())
+//! # }
+//! ```
 
 mod auth;
 mod channel;
