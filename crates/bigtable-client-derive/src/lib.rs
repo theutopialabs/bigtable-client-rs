@@ -18,6 +18,21 @@ mod error;
 use error::Result;
 
 /// Derives `bigtable_client::FromRow` for a named struct.
+///
+/// Set a default family with `#[bigtable(family = "profile")]`. Fields use
+/// their Rust name as the qualifier unless `qualifier` overrides it.
+///
+/// Supported field attributes are:
+///
+/// - `row_key`
+/// - `family = "name"`
+/// - `qualifier = "name"` or `qualifier = b"\xff"`
+/// - `json`
+/// - `with = "decoder_path"`
+/// - `default`
+///
+/// An `Option<T>` field is sparse. A plain field is required and selects the
+/// latest visible cell.
 #[proc_macro_derive(FromRow, attributes(bigtable))]
 pub fn derive_from_row(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);

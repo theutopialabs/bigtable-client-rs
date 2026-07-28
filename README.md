@@ -2,10 +2,10 @@
 
 An async, production-focused Rust client for Google Cloud Bigtable.
 
-This project is under active development. M2 provides high-level reads and
-writes, safe partial retries, bounded bulk requests, deadline policies, and
-direct access to the generated Tonic client. The first supported version will
-be `0.0.1` after M5.
+This project is under active development. M3 provides high-level reads and
+writes, typed row mapping, safe partial retries, bounded bulk requests, deadline
+policies, and direct access to the generated Tonic client. The first supported
+version will be `0.0.1` after M5.
 
 This crate is not published to crates.io.
 
@@ -23,7 +23,7 @@ This crate is not published to crates.io.
 | Single-row and bulk mutations | Available | M2 |
 | Bounded bulk flow control | Available | M2 |
 | Partial mutation retries | Available | M2 |
-| Typed row mapping | Planned | M3 |
+| Typed row mapping and derive | Available | M3 |
 | Tracing and OpenTelemetry | Planned | M4 |
 | Production hardening and `0.0.1` | Planned | M5 |
 
@@ -171,6 +171,85 @@ while let Some(row) = rows.next().await {
 
 Dropping `RowStream` cancels its background read task once the next row is
 ready to send.
+
+## Typed rows
+
+Derive `FromRow` when a Bigtable row has a stable application schema:
+
+```rust,no_run
+use bigtable_client::{Client, FromRow, Query};
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct Preferences {
+    theme: String,
+}
+
+#[derive(Debug, FromRow)]
+#[bigtable(family = "profile")]
+struct User {
+    #[bigtable(row_key)]
+    key: String,
+    name: String,
+    #[bigtable(qualifier = "is_active")]
+    active: bool,
+    nickname: Option<String>,
+    #[bigtable(default)]
+    visits: u64,
+    #[bigtable(json)]
+    preferences: Preferences,
+}
+
+# async fn read(client: &Client) -> Result<(), bigtable_client::Error> {
+let user = client
+    .read_row_as::<User>("users", b"user#42".to_vec())
+    .await?;
+
+let query = Query::new("users")?.prefix(b"user#".to_vec());
+let mut users = client.read_rows_as::<User>(query).await?;
+while let Some(user) = users.next().await {
+    println!("{:?}", user?);
+}
+# Ok(())
+# }
+```
+
+A field uses its Rust name as the qualifier unless `qualifier` overrides it.
+Set a default family on the struct or set `family` on an individual field.
+Qualifiers accept string or byte string literals.
+
+| Attribute | Behavior |
+| --- | --- |
+| `row_key` | Decode the row key into this field |
+| `family = "name"` | Select a column family |
+| `qualifier = "name"` | Select a UTF-8 qualifier |
+| `qualifier = b"\xff"` | Select a binary qualifier |
+| `json` | Decode the cell with Serde JSON |
+| `with = "path"` | Call `fn(&[u8]) -> Result<T, E>` |
+| `default` | Use `Default` when the column is absent |
+
+Plain fields are required and use the latest cell visible after server-side
+filters. `Option<T>` fields return `None` when the family, column, or cell is
+absent. Unknown columns are ignored. Mapping one bad row returns an error for
+that stream item and does not stop later rows.
+
+`FromCellValue` supports `bytes::Bytes`, `Vec<u8>`, UTF-8 `String`, booleans,
+integers, and floats. Boolean and number values use UTF-8 text. Use `with` or a
+custom `FromCellValue` implementation when your schema uses protobuf, fixed
+width numbers, or another binary encoding.
+
+Use `RowDecoder` for manual mappings. It supports required and optional cells,
+JSON, custom decoder functions, raw cells, and all visible versions.
+`RowDecoder::versions` returns `DecodedCell<T>` values with timestamps and
+filter labels in Bigtable's decreasing timestamp order.
+
+Mapping failures use `Error::RowMapping`. The source keeps the raw row key and a
+typed issue for a missing family, column, cell, or invalid value. Decode errors
+also include the family, qualifier, timestamp, and target Rust type.
+
+The typed API includes `read_row_as`, `read_rows_as`, and variants that accept
+`ReadOptions`. Deriving a mapper does not change the query or add filters. Keep
+queries narrow so every required field is returned.
 
 ## Mutations
 
@@ -419,6 +498,11 @@ atomic row changes, partial and streamed retry faults, rich status details,
 malformed response indexes, idempotency safety, cancellation, and live emulator
 writes and deletes.
 
+The M3 suite covers manual and derived mapping, sparse and default fields,
+binary qualifiers, JSON and custom decoders, generic structs, multiple cell
+versions, typed error locations, compiler diagnostics, typed streams, and live
+emulator reads.
+
 Every milestone must pass unit, public API, documentation, MSRV, release,
 package, and emulator tests before it is merged.
 
@@ -430,7 +514,8 @@ package, and emulator tests before it is merged.
   policies
 - M2 complete: single-row and bulk mutations, bounded flow control, partial
   retry handling
-- M3: typed row mapping and derive support
+- M3 complete: typed row mapping, derive support, custom decoders, and typed
+  streams
 - M4: tracing spans, OpenTelemetry metrics, request diagnostics
 - M5: compatibility review, stress tests, docs, and version `0.0.1`
 

@@ -1,8 +1,9 @@
 //! An async Rust client for Google Cloud Bigtable.
 //!
-//! The high-level API provides row queries, streamed row assembly, atomic row
-//! mutations, bulk writes, partial retries, and operation deadlines. The
-//! generated Tonic client remains available for direct data API calls.
+//! The high-level API provides row queries, streamed row assembly, typed row
+//! mapping, atomic row mutations, bulk writes, partial retries, and operation
+//! deadlines. The generated Tonic client remains available for direct data API
+//! calls.
 //!
 //! # Quick start
 //!
@@ -19,6 +20,29 @@
 //! while let Some(row) = rows.next().await {
 //!     println!("{:?}", row?.key);
 //! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Typed rows
+//!
+//! ```no_run
+//! use bigtable_client::{Client, FromRow};
+//!
+//! #[derive(Debug, FromRow)]
+//! #[bigtable(family = "profile")]
+//! struct User {
+//!     #[bigtable(row_key)]
+//!     key: String,
+//!     name: String,
+//!     nickname: Option<String>,
+//! }
+//!
+//! # async fn read(client: &Client) -> Result<(), bigtable_client::Error> {
+//! let user = client
+//!     .read_row_as::<User>("users", b"user#42".to_vec())
+//!     .await?;
+//! println!("{user:?}");
 //! # Ok(())
 //! # }
 //! ```
