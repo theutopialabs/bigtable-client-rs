@@ -60,11 +60,196 @@ pub enum Error {
     /// The internal channel pool stopped while it was being initialized.
     #[error("failed to initialize the Bigtable channel pool")]
     ChannelPoolClosed,
+
+    /// A high-level read query contains an invalid value.
+    #[error("invalid Bigtable query: {issue}")]
+    InvalidQuery {
+        /// Why the query is invalid.
+        issue: QueryIssue,
+    },
+
+    /// Read retry or deadline settings contain an invalid value.
+    #[error("invalid Bigtable read policy: {issue}")]
+    InvalidReadPolicy {
+        /// Why the policy is invalid.
+        issue: ReadPolicyIssue,
+    },
+
+    /// A streamed `ReadRows` response violated the Bigtable wire contract.
+    #[error("invalid Bigtable ReadRows response: {issue}")]
+    InvalidReadRowsResponse {
+        /// The invalid chunk or stream state.
+        issue: RowMergeIssue,
+    },
+
+    /// A `ReadRows` RPC failed and could not be retried.
+    #[error("Bigtable ReadRows failed after {attempts} attempt(s): {source}")]
+    ReadRows {
+        /// Attempts made for this operation.
+        attempts: u32,
+        /// The final gRPC status.
+        #[source]
+        source: tonic::Status,
+    },
+
+    /// The total `ReadRows` operation deadline was exhausted.
+    #[error("Bigtable ReadRows exceeded its {timeout:?} deadline after {attempts} attempt(s)")]
+    ReadDeadlineExceeded {
+        /// Attempts made for this operation.
+        attempts: u32,
+        /// The configured operation timeout.
+        timeout: std::time::Duration,
+    },
+}
+
+/// The reason a streamed row could not be assembled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RowMergeIssue {
+    /// A reset appeared before a row started.
+    ResetBetweenRows,
+    /// A new row did not include a row key.
+    MissingRowKey,
+    /// A new row did not include a family.
+    MissingFamily,
+    /// A new row did not include a qualifier.
+    MissingQualifier,
+    /// A row key changed before the current row committed.
+    RowKeyChanged,
+    /// A family changed without a qualifier.
+    FamilyWithoutQualifier,
+    /// A row or scan marker did not follow query order.
+    OutOfOrderRowKey,
+    /// A scan marker appeared while a row was incomplete.
+    ScanMarkerDuringRow,
+    /// A reset chunk included cell data.
+    ResetWithData,
+    /// A cell value size was negative.
+    NegativeValueSize,
+    /// A split cell started without any value bytes.
+    SplitValueMissingData,
+    /// A split cell received more bytes than declared.
+    SplitValueTooLarge,
+    /// A row committed before a split cell completed.
+    CommitBeforeCellComplete,
+    /// A split cell continuation repeated cell metadata.
+    CellMetadataOnContinuation,
+    /// A split cell changed its declared size.
+    SplitValueSizeChanged,
+    /// A split cell ended before reaching its declared size.
+    SplitValueWrongSize,
+    /// The response stream ended with an incomplete row.
+    IncompleteRow,
+}
+
+impl fmt::Display for RowMergeIssue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ResetBetweenRows => "reset_row is not valid between rows",
+            Self::MissingRowKey => "a new row is missing its row key",
+            Self::MissingFamily => "a new row is missing its column family",
+            Self::MissingQualifier => "a new row is missing its column qualifier",
+            Self::RowKeyChanged => "the row key changed before commit_row",
+            Self::FamilyWithoutQualifier => {
+                "a new column family did not include a column qualifier"
+            }
+            Self::OutOfOrderRowKey => "row keys are not in strict query order",
+            Self::ScanMarkerDuringRow => "last_scanned_row_key appeared during an incomplete row",
+            Self::ResetWithData => "reset_row must not include cell data",
+            Self::NegativeValueSize => "value_size must not be negative",
+            Self::SplitValueMissingData => "a split cell must start with value bytes",
+            Self::SplitValueTooLarge => "a split cell exceeded its declared value_size",
+            Self::CommitBeforeCellComplete => "commit_row appeared before a split cell completed",
+            Self::CellMetadataOnContinuation => "a split cell continuation repeated cell metadata",
+            Self::SplitValueSizeChanged => {
+                "a split cell continuation changed its declared value_size"
+            }
+            Self::SplitValueWrongSize => {
+                "a split cell ended before reaching its declared value_size"
+            }
+            Self::IncompleteRow => "the response stream ended before commit_row",
+        })
+    }
 }
 
 impl Error {
     pub(crate) const fn invalid_config(field: ConfigField, issue: ConfigIssue) -> Self {
         Self::InvalidConfig { field, issue }
+    }
+
+    pub(crate) const fn invalid_query(issue: QueryIssue) -> Self {
+        Self::InvalidQuery { issue }
+    }
+
+    pub(crate) const fn invalid_read_policy(issue: ReadPolicyIssue) -> Self {
+        Self::InvalidReadPolicy { issue }
+    }
+}
+
+/// The reason a high-level read query is invalid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum QueryIssue {
+    /// The table ID is empty.
+    EmptyTableId,
+    /// The table ID exceeds Bigtable's 50-character limit.
+    TableIdTooLong,
+    /// The table ID contains a resource path separator.
+    TableIdContainsSlash,
+    /// A row limit is zero.
+    ZeroRowLimit,
+    /// A row limit is larger than the API can represent.
+    RowLimitTooLarge,
+}
+
+impl fmt::Display for QueryIssue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::EmptyTableId => "table_id must not be empty",
+            Self::TableIdTooLong => "table_id must not exceed 50 characters",
+            Self::TableIdContainsSlash => "table_id must not contain '/'",
+            Self::ZeroRowLimit => "row limit must be greater than zero",
+            Self::RowLimitTooLarge => "row limit must fit in a signed 64-bit integer",
+        })
+    }
+}
+
+/// The reason a read retry or deadline policy is invalid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ReadPolicyIssue {
+    /// No request attempts are allowed.
+    ZeroMaxAttempts,
+    /// The initial retry backoff is zero.
+    ZeroInitialBackoff,
+    /// The maximum retry backoff is zero.
+    ZeroMaxBackoff,
+    /// The maximum backoff is smaller than the initial backoff.
+    MaxBackoffTooSmall,
+    /// The backoff multiplier is below one or is not finite.
+    InvalidBackoffMultiplier,
+    /// The operation timeout is zero.
+    ZeroOperationTimeout,
+    /// The attempt timeout is zero.
+    ZeroAttemptTimeout,
+    /// A deadline cannot be represented by the runtime clock.
+    DeadlineTooLarge,
+}
+
+impl fmt::Display for ReadPolicyIssue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ZeroMaxAttempts => "max_attempts must be greater than zero",
+            Self::ZeroInitialBackoff => "initial_backoff must be greater than zero",
+            Self::ZeroMaxBackoff => "max_backoff must be greater than zero",
+            Self::MaxBackoffTooSmall => "max_backoff must not be smaller than initial_backoff",
+            Self::InvalidBackoffMultiplier => {
+                "multiplier must be finite and greater than or equal to one"
+            }
+            Self::ZeroOperationTimeout => "operation_timeout must be greater than zero",
+            Self::ZeroAttemptTimeout => "attempt_timeout must be greater than zero",
+            Self::DeadlineTooLarge => "deadline is too large for the runtime clock",
+        })
     }
 }
 
@@ -135,7 +320,7 @@ impl fmt::Display for ConfigIssue {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigField, ConfigIssue, Error};
+    use super::{ConfigField, ConfigIssue, Error, QueryIssue, ReadPolicyIssue};
 
     #[test]
     fn invalid_config_display_names_the_field_and_issue() {
@@ -243,6 +428,75 @@ mod tests {
                 "must be an absolute HTTP or HTTPS URI",
             ),
             (ConfigIssue::MustBePositive, "must be greater than zero"),
+        ];
+
+        for (issue, expected) in cases {
+            assert_eq!(issue.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn every_query_issue_has_clear_guidance() {
+        let cases = [
+            (QueryIssue::EmptyTableId, "table_id must not be empty"),
+            (
+                QueryIssue::TableIdTooLong,
+                "table_id must not exceed 50 characters",
+            ),
+            (
+                QueryIssue::TableIdContainsSlash,
+                "table_id must not contain '/'",
+            ),
+            (
+                QueryIssue::ZeroRowLimit,
+                "row limit must be greater than zero",
+            ),
+            (
+                QueryIssue::RowLimitTooLarge,
+                "row limit must fit in a signed 64-bit integer",
+            ),
+        ];
+
+        for (issue, expected) in cases {
+            assert_eq!(issue.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn every_read_policy_issue_has_clear_guidance() {
+        let cases = [
+            (
+                ReadPolicyIssue::ZeroMaxAttempts,
+                "max_attempts must be greater than zero",
+            ),
+            (
+                ReadPolicyIssue::ZeroInitialBackoff,
+                "initial_backoff must be greater than zero",
+            ),
+            (
+                ReadPolicyIssue::ZeroMaxBackoff,
+                "max_backoff must be greater than zero",
+            ),
+            (
+                ReadPolicyIssue::MaxBackoffTooSmall,
+                "max_backoff must not be smaller than initial_backoff",
+            ),
+            (
+                ReadPolicyIssue::InvalidBackoffMultiplier,
+                "multiplier must be finite and greater than or equal to one",
+            ),
+            (
+                ReadPolicyIssue::ZeroOperationTimeout,
+                "operation_timeout must be greater than zero",
+            ),
+            (
+                ReadPolicyIssue::ZeroAttemptTimeout,
+                "attempt_timeout must be greater than zero",
+            ),
+            (
+                ReadPolicyIssue::DeadlineTooLarge,
+                "deadline is too large for the runtime clock",
+            ),
         ];
 
         for (issue, expected) in cases {

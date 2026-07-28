@@ -43,7 +43,6 @@ fn build_endpoint(config: &ClientConfig) -> Result<Endpoint, Error> {
         })?;
     let mut endpoint = Endpoint::from(uri)
         .connect_timeout(config.connect_timeout())
-        .timeout(config.request_timeout())
         .http2_keep_alive_interval(config.keep_alive_interval())
         .keep_alive_timeout(config.keep_alive_timeout())
         .keep_alive_while_idle(true)

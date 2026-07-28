@@ -13,7 +13,7 @@ const DEFAULT_APP_PROFILE_ID: &str = "default";
 const DEFAULT_ENDPOINT: &str = "https://bigtable.googleapis.com";
 const DEFAULT_CHANNEL_POOL_SIZE: usize = 1;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 

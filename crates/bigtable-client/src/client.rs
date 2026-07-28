@@ -11,10 +11,11 @@ use tonic::{
 };
 
 use crate::{
-    ClientConfig, Error,
+    ClientConfig, Error, Query, ReadOptions, Row, RowStream,
     auth::{GcpTokenSource, TokenManager},
     channel,
     proto::{FeatureFlags, bigtable_client::BigtableClient},
+    read,
 };
 
 const API_CLIENT_HEADER: &str = concat!(
@@ -89,6 +90,55 @@ impl Client {
     #[must_use]
     pub fn raw_client(&self) -> RawClient {
         self.inner.raw.clone()
+    }
+
+    /// Starts a high-level streaming row query.
+    ///
+    /// The client assembles complete rows, retries transient failures, and
+    /// resumes after the latest safe row key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the retry policy is invalid, routing metadata
+    /// cannot be encoded, or the first RPC cannot be started. Errors after the
+    /// stream starts are returned as stream items.
+    pub async fn read_rows(&self, query: Query) -> Result<RowStream, Error> {
+        let mut options = ReadOptions::default();
+        options.deadlines.operation_timeout = self.config().request_timeout();
+        read::start(self.raw_client(), self.config(), query, options).await
+    }
+
+    /// Starts a row query with caller-provided retry and deadline settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the policy is invalid, routing metadata cannot be
+    /// encoded, or the first RPC cannot be started. Errors after the stream
+    /// starts are returned as stream items.
+    pub async fn read_rows_with_options(
+        &self,
+        query: Query,
+        options: ReadOptions,
+    ) -> Result<RowStream, Error> {
+        read::start(self.raw_client(), self.config(), query, options).await
+    }
+
+    /// Reads one row by exact key.
+    ///
+    /// # Errors
+    ///
+    /// Returns query, policy, gRPC, deadline, or row assembly errors.
+    pub async fn read_row(
+        &self,
+        table_id: impl Into<String>,
+        row_key: impl Into<bytes::Bytes>,
+    ) -> Result<Option<Row>, Error> {
+        let query = Query::new(table_id)?.row_key(row_key).limit(1)?;
+        let mut rows = self.read_rows(query).await?;
+        match rows.next().await {
+            Some(row) => row.map(Some),
+            None => Ok(None),
+        }
     }
 
     async fn connect_inner(
@@ -171,6 +221,7 @@ fn feature_flags_header() -> Result<MetadataValue<Ascii>, Error> {
     let flags = FeatureFlags {
         reverse_scans: true,
         last_scanned_row_responses: true,
+        retry_info: true,
         ..FeatureFlags::default()
     };
     URL_SAFE_NO_PAD
@@ -230,7 +281,7 @@ mod tests {
         assert!(!flags.mutate_rows_rate_limit);
         assert!(!flags.mutate_rows_rate_limit2);
         assert!(!flags.routing_cookie);
-        assert!(!flags.retry_info);
+        assert!(flags.retry_info);
         assert!(!flags.client_side_metrics_enabled);
         assert!(!flags.traffic_director_enabled);
         assert!(!flags.direct_access_requested);
