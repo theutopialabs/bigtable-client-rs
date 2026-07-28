@@ -12,7 +12,7 @@ repository = "https://github.com/theutopialabs/bigtable-client-rs"
 [workspace.dependencies]
 arc-swap = "1.9.0"
 async-trait = "0.1.89"
-base64 = "0.22.1"
+base64 = "0.23.0"
 figment = { version = "0.10.19", features = ["env"] }
 gcp_auth = { version = "0.12.7", default-features = false, features = ["ring", "webpki-roots"] }
 googleapis-tonic-google-bigtable-v2 = { version = "0.39.0", default-features = false, features = ["bytes", "hash-map"] }
