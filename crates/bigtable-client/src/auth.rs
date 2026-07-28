@@ -180,7 +180,7 @@ mod tests {
     use crate::Error;
 
     struct FakeTokenSource {
-        tokens: Mutex<VecDeque<AccessToken>>,
+        tokens: Mutex<VecDeque<Result<AccessToken, Error>>>,
     }
 
     #[async_trait]
@@ -190,7 +190,7 @@ mod tests {
                 .lock()
                 .expect("fake token lock should not be poisoned")
                 .pop_front()
-                .ok_or(Error::ChannelPoolClosed)
+                .unwrap_or(Err(Error::ChannelPoolClosed))
         }
     }
 
@@ -223,6 +223,47 @@ mod tests {
         panic!("token was not refreshed");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn manager_recovers_after_refresh_failure() {
+        let manager = TokenManager::start(fake_results([
+            Ok(token("first", 1)),
+            Err(Error::ChannelPoolClosed),
+            Ok(token("recovered", 3_600)),
+        ]))
+        .await
+        .expect("initial token is valid");
+        let expected = "Bearer recovered".parse().expect("valid metadata");
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        for _ in 0..20 {
+            if manager.authorization().ok().as_ref() == Some(&expected) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        panic!("token refresh did not recover");
+    }
+
+    #[tokio::test]
+    async fn manager_reports_initial_source_failure() {
+        let error = TokenManager::start(fake_results([Err(Error::ChannelPoolClosed)]))
+            .await
+            .expect_err("initial token is required");
+
+        assert!(matches!(error, Error::ChannelPoolClosed));
+    }
+
+    #[tokio::test]
+    async fn manager_rejects_invalid_token_metadata() {
+        let error = TokenManager::start(fake_source([token("bad\nvalue", 3_600)]))
+            .await
+            .expect_err("invalid metadata must be rejected");
+
+        assert!(matches!(error, Error::InvalidAccessToken { .. }));
+    }
+
     #[tokio::test]
     async fn manager_rejects_expired_token() {
         let manager = TokenManager::start(fake_source([token("expired", 0)]))
@@ -248,6 +289,12 @@ mod tests {
     }
 
     fn fake_source<const N: usize>(tokens: [AccessToken; N]) -> Arc<dyn TokenSource> {
+        fake_results(tokens.map(Ok))
+    }
+
+    fn fake_results<const N: usize>(
+        tokens: [Result<AccessToken, Error>; N],
+    ) -> Arc<dyn TokenSource> {
         Arc::new(FakeTokenSource {
             tokens: Mutex::new(tokens.into()),
         })

@@ -318,7 +318,8 @@ fn valid_uri(value: &str, field: ConfigField) -> Result<String, Error> {
         .parse::<Uri>()
         .map_err(|_| Error::invalid_config(field, ConfigIssue::InvalidUri))?;
     let valid_scheme = matches!(uri.scheme_str(), Some("http" | "https"));
-    if !valid_scheme || uri.authority().is_none() {
+    let valid_path = matches!(uri.path(), "" | "/");
+    if !valid_scheme || uri.authority().is_none() || !valid_path || uri.query().is_some() {
         return Err(Error::invalid_config(field, ConfigIssue::InvalidUri));
     }
     Ok(value)
@@ -499,6 +500,18 @@ mod tests {
                 ClientConfig::new("project", "instance")
                     .expect("valid config")
                     .with_emulator_host("ftp://localhost:8086"),
+                ConfigField::EmulatorHost,
+            ),
+            (
+                ClientConfig::new("project", "instance")
+                    .expect("valid config")
+                    .with_endpoint("https://example.test/v2"),
+                ConfigField::Endpoint,
+            ),
+            (
+                ClientConfig::new("project", "instance")
+                    .expect("valid config")
+                    .with_emulator_host("http://localhost:8086?debug=true"),
                 ConfigField::EmulatorHost,
             ),
         ];
