@@ -11,11 +11,12 @@ use tonic::{
 };
 
 use crate::{
-    ClientConfig, Error, Query, ReadOptions, Row, RowStream,
+    BulkMutation, BulkMutationOptions, BulkMutationResult, ClientConfig, Error, Query, ReadOptions,
+    Row, RowMutation, RowStream,
     auth::{GcpTokenSource, TokenManager},
     channel,
     proto::{FeatureFlags, bigtable_client::BigtableClient},
-    read,
+    read, write,
 };
 
 const API_CLIENT_HEADER: &str = concat!(
@@ -139,6 +140,68 @@ impl Client {
             Some(row) => row.map(Some),
             None => Ok(None),
         }
+    }
+
+    /// Applies row mutations in bounded concurrent batches.
+    ///
+    /// Each row entry is atomic. Entries may run in any order. The client
+    /// retries only unresolved entries that are safe to replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns policy or metadata errors before sending. Returns
+    /// [`Error::BulkMutation`] with original entry indexes when one or more
+    /// entries lack a confirmed success.
+    pub async fn mutate_rows(&self, mutation: BulkMutation) -> Result<BulkMutationResult, Error> {
+        let mut options = BulkMutationOptions::default();
+        options.deadlines.operation_timeout = self.config().request_timeout();
+        write::execute(self.raw_client(), self.config(), mutation, options).await
+    }
+
+    /// Applies row mutations with caller-provided policies.
+    ///
+    /// # Errors
+    ///
+    /// Returns policy or metadata errors before sending. Returns
+    /// [`Error::BulkMutation`] with original entry indexes when one or more
+    /// entries lack a confirmed success.
+    pub async fn mutate_rows_with_options(
+        &self,
+        mutation: BulkMutation,
+        options: BulkMutationOptions,
+    ) -> Result<BulkMutationResult, Error> {
+        write::execute(self.raw_client(), self.config(), mutation, options).await
+    }
+
+    /// Applies one atomic row mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns mutation, policy, metadata, deadline, or gRPC errors.
+    pub async fn mutate_row(
+        &self,
+        table_id: impl Into<String>,
+        mutation: RowMutation,
+    ) -> Result<(), Error> {
+        let bulk = BulkMutation::new(table_id)?.entry(mutation)?;
+        self.mutate_rows(bulk).await?;
+        Ok(())
+    }
+
+    /// Applies one atomic row mutation with caller-provided policies.
+    ///
+    /// # Errors
+    ///
+    /// Returns mutation, policy, metadata, deadline, or gRPC errors.
+    pub async fn mutate_row_with_options(
+        &self,
+        table_id: impl Into<String>,
+        mutation: RowMutation,
+        options: BulkMutationOptions,
+    ) -> Result<(), Error> {
+        let bulk = BulkMutation::new(table_id)?.entry(mutation)?;
+        self.mutate_rows_with_options(bulk, options).await?;
+        Ok(())
     }
 
     async fn connect_inner(

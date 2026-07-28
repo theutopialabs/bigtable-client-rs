@@ -68,6 +68,30 @@ pub enum Error {
         issue: QueryIssue,
     },
 
+    /// A high-level mutation contains a value Bigtable cannot accept.
+    ///
+    /// Check `issue`, fix the input, and rebuild the mutation before retrying.
+    #[error("invalid Bigtable mutation: {issue}")]
+    InvalidMutation {
+        /// Why the mutation is invalid.
+        issue: MutationIssue,
+    },
+
+    /// Bulk mutation retry, deadline, or batching settings are invalid.
+    ///
+    /// Check `issue`, fix the setting, and start the operation again.
+    #[error("invalid Bigtable bulk mutation policy: {issue}")]
+    InvalidBulkMutationPolicy {
+        /// Why the policy is invalid.
+        issue: BulkMutationPolicyIssue,
+    },
+
+    /// One or more row mutations did not receive a confirmed success.
+    ///
+    /// Inspect the grouped failure indexes before deciding what to replay.
+    #[error(transparent)]
+    BulkMutation(#[from] BulkMutationError),
+
     /// Read retry or deadline settings contain an invalid value.
     #[error("invalid Bigtable read policy: {issue}")]
     InvalidReadPolicy {
@@ -181,8 +205,314 @@ impl Error {
         Self::InvalidQuery { issue }
     }
 
+    pub(crate) const fn invalid_mutation(issue: MutationIssue) -> Self {
+        Self::InvalidMutation { issue }
+    }
+
+    pub(crate) const fn invalid_bulk_mutation_policy(issue: BulkMutationPolicyIssue) -> Self {
+        Self::InvalidBulkMutationPolicy { issue }
+    }
+
     pub(crate) const fn invalid_read_policy(issue: ReadPolicyIssue) -> Self {
         Self::InvalidReadPolicy { issue }
+    }
+}
+
+/// Invalid bulk mutation retry, deadline, or batching settings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum BulkMutationPolicyIssue {
+    /// No request attempts are allowed.
+    ZeroMaxAttempts,
+    /// The initial retry backoff is zero.
+    ZeroInitialBackoff,
+    /// The maximum retry backoff is zero.
+    ZeroMaxBackoff,
+    /// The maximum backoff is smaller than the initial backoff.
+    MaxBackoffTooSmall,
+    /// The backoff multiplier is below one or is not finite.
+    InvalidBackoffMultiplier,
+    /// The operation timeout is zero.
+    ZeroOperationTimeout,
+    /// The attempt timeout is zero.
+    ZeroAttemptTimeout,
+    /// No entries are allowed in a request.
+    ZeroEntriesPerRequest,
+    /// The target request byte size is zero.
+    ZeroRequestBytes,
+    /// No requests are allowed in flight.
+    ZeroInFlightRequests,
+    /// A deadline cannot be represented by the runtime clock.
+    DeadlineTooLarge,
+}
+
+impl fmt::Display for BulkMutationPolicyIssue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ZeroMaxAttempts => "max_attempts must be greater than zero",
+            Self::ZeroInitialBackoff => "initial_backoff must be greater than zero",
+            Self::ZeroMaxBackoff => "max_backoff must be greater than zero",
+            Self::MaxBackoffTooSmall => "max_backoff must not be smaller than initial_backoff",
+            Self::InvalidBackoffMultiplier => {
+                "multiplier must be finite and greater than or equal to one"
+            }
+            Self::ZeroOperationTimeout => "operation_timeout must be greater than zero",
+            Self::ZeroAttemptTimeout => "attempt_timeout must be greater than zero",
+            Self::ZeroEntriesPerRequest => "max_entries_per_request must be greater than zero",
+            Self::ZeroRequestBytes => "max_request_bytes must be greater than zero",
+            Self::ZeroInFlightRequests => "max_in_flight_requests must be greater than zero",
+            Self::DeadlineTooLarge => "deadline is too large for the runtime clock",
+        })
+    }
+}
+
+/// A malformed result in a streamed `MutateRows` response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum MutateRowsResponseIssue {
+    /// A response index was negative.
+    NegativeIndex {
+        /// The invalid response index.
+        index: i64,
+    },
+    /// A response index did not refer to an entry in the current request.
+    IndexOutOfRange {
+        /// The invalid response index.
+        index: i64,
+        /// Entries sent in the current request.
+        entry_count: usize,
+    },
+    /// The stream reported one request entry more than once.
+    DuplicateIndex {
+        /// The repeated request-local index.
+        index: usize,
+    },
+    /// The stream ended without reporting an entry.
+    MissingIndex {
+        /// The missing request-local index.
+        index: usize,
+    },
+}
+
+impl fmt::Display for MutateRowsResponseIssue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NegativeIndex { index } => {
+                write!(formatter, "response index {index} must not be negative")
+            }
+            Self::IndexOutOfRange { index, entry_count } => write!(
+                formatter,
+                "response index {index} is outside the {entry_count}-entry request"
+            ),
+            Self::DuplicateIndex { index } => {
+                write!(
+                    formatter,
+                    "response index {index} was reported more than once"
+                )
+            }
+            Self::MissingIndex { index } => {
+                write!(formatter, "response index {index} was not reported")
+            }
+        }
+    }
+}
+
+/// Why one bulk mutation entry lacks a confirmed success.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum MutationFailureCause {
+    /// Bigtable returned a non-OK status for this entry.
+    #[error("entry failed: {status}")]
+    EntryStatus {
+        /// The entry status, including rich status details when present.
+        #[source]
+        status: tonic::Status,
+        /// Whether replaying the entry is idempotent.
+        retry_safe: bool,
+    },
+    /// The RPC ended before this entry received a result.
+    #[error("mutation result was interrupted: {status}")]
+    RpcStatus {
+        /// The RPC status.
+        #[source]
+        status: tonic::Status,
+        /// Whether replaying the entry is idempotent.
+        retry_safe: bool,
+    },
+    /// The operation deadline ended before this entry completed.
+    #[error("mutation exceeded the {timeout:?} operation deadline")]
+    DeadlineExceeded {
+        /// The configured operation timeout.
+        timeout: std::time::Duration,
+    },
+    /// The response stream violated the `MutateRows` wire contract.
+    #[error("invalid MutateRows response: {issue}")]
+    InvalidResponse {
+        /// The invalid index state.
+        issue: MutateRowsResponseIssue,
+    },
+}
+
+impl MutationFailureCause {
+    /// Returns the gRPC status when the failure came from Bigtable or transport.
+    #[must_use]
+    pub const fn status(&self) -> Option<&tonic::Status> {
+        match self {
+            Self::EntryStatus { status, .. } | Self::RpcStatus { status, .. } => Some(status),
+            Self::DeadlineExceeded { .. } | Self::InvalidResponse { .. } => None,
+        }
+    }
+
+    /// Returns whether replaying the entry is idempotent.
+    #[must_use]
+    pub const fn retry_safe(&self) -> bool {
+        match self {
+            Self::EntryStatus { retry_safe, .. } | Self::RpcStatus { retry_safe, .. } => {
+                *retry_safe
+            }
+            Self::DeadlineExceeded { .. } | Self::InvalidResponse { .. } => false,
+        }
+    }
+}
+
+/// One failed entry from the original bulk mutation.
+#[derive(Debug)]
+pub struct MutationFailure {
+    pub(crate) index: usize,
+    pub(crate) attempts: u32,
+    pub(crate) cause: MutationFailureCause,
+}
+
+impl MutationFailure {
+    /// Returns the entry index in the original bulk mutation.
+    #[must_use]
+    pub const fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Returns how many RPC attempts included this entry.
+    #[must_use]
+    pub const fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    /// Returns why the entry lacks a confirmed success.
+    #[must_use]
+    pub const fn cause(&self) -> &MutationFailureCause {
+        &self.cause
+    }
+}
+
+/// Grouped failures from one bulk mutation operation.
+#[derive(Debug)]
+pub struct BulkMutationError {
+    pub(crate) total_entries: usize,
+    pub(crate) successful_entries: usize,
+    pub(crate) rpc_attempts: u32,
+    pub(crate) failures: Vec<MutationFailure>,
+}
+
+impl BulkMutationError {
+    /// Returns the number of entries in the original operation.
+    #[must_use]
+    pub const fn total_entries(&self) -> usize {
+        self.total_entries
+    }
+
+    /// Returns the number of entries with confirmed success.
+    #[must_use]
+    pub const fn successful_entries(&self) -> usize {
+        self.successful_entries
+    }
+
+    /// Returns the total RPC attempts across every request batch.
+    #[must_use]
+    pub const fn rpc_attempts(&self) -> u32 {
+        self.rpc_attempts
+    }
+
+    /// Returns failures ordered by their original entry index.
+    #[must_use]
+    pub fn failures(&self) -> &[MutationFailure] {
+        &self.failures
+    }
+}
+
+impl fmt::Display for BulkMutationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Bigtable MutateRows confirmed {} of {} entries after {} RPC attempt(s); {} failed",
+            self.successful_entries,
+            self.total_entries,
+            self.rpc_attempts,
+            self.failures.len()
+        )
+    }
+}
+
+impl std::error::Error for BulkMutationError {}
+
+/// The reason a high-level mutation is invalid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum MutationIssue {
+    /// The table ID is empty.
+    EmptyTableId,
+    /// The table ID exceeds Bigtable's 50-character limit.
+    TableIdTooLong,
+    /// The table ID contains a resource path separator.
+    TableIdContainsSlash,
+    /// The row key is empty.
+    EmptyRowKey,
+    /// The row key exceeds Bigtable's 4 KiB limit.
+    RowKeyTooLong,
+    /// A column family name is empty.
+    EmptyFamilyName,
+    /// A column family name contains an unsupported byte.
+    InvalidFamilyName,
+    /// A cell timestamp is negative.
+    NegativeTimestamp,
+    /// A cell timestamp does not use millisecond granularity.
+    TimestampNotMillisecondAligned,
+    /// A timestamp range is empty or reversed.
+    InvalidTimestampRange,
+    /// An advanced protobuf mutation has no operation.
+    MissingOperation,
+    /// A row entry has no mutations.
+    EmptyRowMutation,
+    /// A row entry exceeds the API mutation count limit.
+    TooManyMutations,
+    /// An idempotency token is shorter than eight bytes.
+    IdempotencyTokenTooShort,
+    /// The system clock is earlier than the Unix epoch.
+    ClockBeforeUnixEpoch,
+    /// The system clock cannot fit in a Bigtable timestamp.
+    ClockOutOfRange,
+}
+
+impl fmt::Display for MutationIssue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::EmptyTableId => "table_id must not be empty",
+            Self::TableIdTooLong => "table_id must not exceed 50 characters",
+            Self::TableIdContainsSlash => "table_id must not contain '/'",
+            Self::EmptyRowKey => "row key must not be empty",
+            Self::RowKeyTooLong => "row key must not exceed 4 KiB",
+            Self::EmptyFamilyName => "family_name must not be empty",
+            Self::InvalidFamilyName => {
+                "family_name may contain only ASCII letters, digits, '-', '_', and '.'"
+            }
+            Self::NegativeTimestamp => "timestamp_micros must not be negative",
+            Self::TimestampNotMillisecondAligned => "timestamp_micros must be a multiple of 1000",
+            Self::InvalidTimestampRange => "timestamp range start must be smaller than its end",
+            Self::MissingOperation => "protobuf mutation must contain an operation",
+            Self::EmptyRowMutation => "row mutation must contain at least one change",
+            Self::TooManyMutations => "row mutation must not exceed 100000 changes",
+            Self::IdempotencyTokenTooShort => "idempotency token must contain at least eight bytes",
+            Self::ClockBeforeUnixEpoch => "system clock must not be earlier than the Unix epoch",
+            Self::ClockOutOfRange => "system clock is too large for a Bigtable timestamp",
+        })
     }
 }
 
@@ -320,7 +650,11 @@ impl fmt::Display for ConfigIssue {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigField, ConfigIssue, Error, QueryIssue, ReadPolicyIssue, RowMergeIssue};
+    use super::{
+        BulkMutationError, BulkMutationPolicyIssue, ConfigField, ConfigIssue, Error,
+        MutateRowsResponseIssue, MutationFailure, MutationFailureCause, MutationIssue, QueryIssue,
+        ReadPolicyIssue, RowMergeIssue,
+    };
 
     #[test]
     fn invalid_config_display_names_the_field_and_issue() {
@@ -330,6 +664,116 @@ mod tests {
             error.to_string(),
             "invalid Bigtable configuration for project_id: must not be empty"
         );
+    }
+
+    #[test]
+    fn mutation_errors_include_recovery_context() {
+        let error = Error::invalid_mutation(MutationIssue::EmptyRowMutation);
+
+        assert_eq!(
+            error.to_string(),
+            "invalid Bigtable mutation: row mutation must contain at least one change"
+        );
+    }
+
+    #[test]
+    fn every_mutation_issue_has_clear_guidance() {
+        let issues = [
+            MutationIssue::EmptyTableId,
+            MutationIssue::TableIdTooLong,
+            MutationIssue::TableIdContainsSlash,
+            MutationIssue::EmptyRowKey,
+            MutationIssue::RowKeyTooLong,
+            MutationIssue::EmptyFamilyName,
+            MutationIssue::InvalidFamilyName,
+            MutationIssue::NegativeTimestamp,
+            MutationIssue::TimestampNotMillisecondAligned,
+            MutationIssue::InvalidTimestampRange,
+            MutationIssue::MissingOperation,
+            MutationIssue::EmptyRowMutation,
+            MutationIssue::TooManyMutations,
+            MutationIssue::IdempotencyTokenTooShort,
+            MutationIssue::ClockBeforeUnixEpoch,
+            MutationIssue::ClockOutOfRange,
+        ];
+
+        for issue in issues {
+            assert!(!issue.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn bulk_mutation_policy_issues_have_clear_guidance() {
+        let issues = [
+            BulkMutationPolicyIssue::ZeroMaxAttempts,
+            BulkMutationPolicyIssue::ZeroInitialBackoff,
+            BulkMutationPolicyIssue::ZeroMaxBackoff,
+            BulkMutationPolicyIssue::MaxBackoffTooSmall,
+            BulkMutationPolicyIssue::InvalidBackoffMultiplier,
+            BulkMutationPolicyIssue::ZeroOperationTimeout,
+            BulkMutationPolicyIssue::ZeroAttemptTimeout,
+            BulkMutationPolicyIssue::ZeroEntriesPerRequest,
+            BulkMutationPolicyIssue::ZeroRequestBytes,
+            BulkMutationPolicyIssue::ZeroInFlightRequests,
+            BulkMutationPolicyIssue::DeadlineTooLarge,
+        ];
+
+        for issue in issues {
+            assert!(!issue.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn bulk_mutation_error_exposes_partial_success_and_failure_context() {
+        let error = BulkMutationError {
+            total_entries: 2,
+            successful_entries: 1,
+            rpc_attempts: 3,
+            failures: vec![MutationFailure {
+                index: 1,
+                attempts: 2,
+                cause: MutationFailureCause::EntryStatus {
+                    status: tonic::Status::invalid_argument("bad cell"),
+                    retry_safe: true,
+                },
+            }],
+        };
+
+        assert_eq!(error.total_entries(), 2);
+        assert_eq!(error.successful_entries(), 1);
+        assert_eq!(error.rpc_attempts(), 3);
+        assert_eq!(error.failures()[0].index(), 1);
+        assert_eq!(error.failures()[0].attempts(), 2);
+        assert!(error.failures()[0].cause().retry_safe());
+        assert_eq!(
+            error.failures()[0]
+                .cause()
+                .status()
+                .expect("entry status")
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            error.to_string(),
+            "Bigtable MutateRows confirmed 1 of 2 entries after 3 RPC attempt(s); 1 failed"
+        );
+    }
+
+    #[test]
+    fn mutate_rows_response_issues_name_the_invalid_index_state() {
+        let issues = [
+            MutateRowsResponseIssue::NegativeIndex { index: -1 },
+            MutateRowsResponseIssue::IndexOutOfRange {
+                index: 4,
+                entry_count: 2,
+            },
+            MutateRowsResponseIssue::DuplicateIndex { index: 1 },
+            MutateRowsResponseIssue::MissingIndex { index: 0 },
+        ];
+
+        for issue in issues {
+            assert!(!issue.to_string().is_empty());
+        }
     }
 
     #[test]

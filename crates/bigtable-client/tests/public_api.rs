@@ -3,8 +3,10 @@
 use std::time::Duration;
 
 use bigtable_client::{
-    Cell, ClientConfig, Column, ConfigField, ConfigIssue, DeadlinePolicy, Error, Family, Jitter,
-    Query, QueryIssue, ReadOptions, RetryPolicy, Row, RowBound, RowRange, RowStream, proto,
+    BatchPolicy, BulkMutation, BulkMutationOptions, BulkMutationPolicyIssue, Cell, ClientConfig,
+    Column, ConfigField, ConfigIssue, DeadlinePolicy, Error, Family, Jitter, Mutation,
+    MutationIssue, Query, QueryIssue, ReadOptions, RetryPolicy, Row, RowBound, RowMutation,
+    RowRange, RowStream, proto,
 };
 use bytes::Bytes;
 use futures_core::Stream;
@@ -110,6 +112,88 @@ fn public_read_policies_are_configurable() {
 
     assert_eq!(options.retry.max_attempts, 5);
     assert_eq!(options.deadlines.attempt_timeout, Duration::from_secs(5));
+}
+
+#[test]
+fn public_mutation_types_support_binary_data_and_retry_safety() {
+    let row = RowMutation::new(Bytes::from_static(b"\x00row"))
+        .expect("valid binary row key")
+        .mutation(
+            Mutation::set_cell_at(
+                "data",
+                Bytes::from_static(b"\xffqualifier"),
+                1_000,
+                Bytes::from_static(b"\x00\xff"),
+            )
+            .expect("valid cell"),
+        )
+        .expect("within mutation limit")
+        .mutation(Mutation::delete_family("old_data").expect("valid family"))
+        .expect("within mutation limit");
+    let bulk = BulkMutation::new("events")
+        .expect("valid table")
+        .entry(row.clone())
+        .expect("nonempty row");
+
+    assert_eq!(row.row_key().as_ref(), b"\x00row");
+    assert_eq!(row.len(), 2);
+    assert!(row.is_retry_safe());
+    assert_eq!(bulk.table_id(), "events");
+    assert_eq!(bulk.len(), 1);
+
+    let unsafe_row = RowMutation::new("server-time")
+        .expect("valid row")
+        .mutation(
+            Mutation::set_cell_at_server_time("data", "value", "payload")
+                .expect("valid server-time cell"),
+        )
+        .expect("within mutation limit");
+    assert!(!unsafe_row.is_retry_safe());
+}
+
+#[test]
+fn public_mutation_errors_are_typed() {
+    let empty_row = RowMutation::new("row").expect("valid row");
+    let error = BulkMutation::new("events")
+        .expect("valid table")
+        .entry(empty_row)
+        .expect_err("empty row mutation is rejected");
+
+    assert!(matches!(
+        error,
+        Error::InvalidMutation {
+            issue: MutationIssue::EmptyRowMutation
+        }
+    ));
+}
+
+#[test]
+fn public_bulk_mutation_policies_are_configurable() {
+    let options = BulkMutationOptions {
+        retry: RetryPolicy {
+            max_attempts: 4,
+            initial_backoff: Duration::from_millis(20),
+            max_backoff: Duration::from_secs(1),
+            multiplier: 2.0,
+            jitter: Jitter::None,
+        },
+        deadlines: DeadlinePolicy {
+            operation_timeout: Duration::from_secs(20),
+            attempt_timeout: Duration::from_secs(3),
+        },
+        batch: BatchPolicy {
+            max_entries_per_request: 50,
+            max_request_bytes: 4 * 1024 * 1024,
+            max_in_flight_requests: 3,
+        },
+    };
+
+    assert_eq!(options.batch.max_entries_per_request, 50);
+    assert_eq!(options.batch.max_in_flight_requests, 3);
+    assert_eq!(
+        BulkMutationPolicyIssue::ZeroInFlightRequests.to_string(),
+        "max_in_flight_requests must be greater than zero"
+    );
 }
 
 #[test]

@@ -19,7 +19,7 @@ pub enum Jitter {
     None,
 }
 
-/// Retry settings for a `ReadRows` operation.
+/// Retry settings for a high-level Bigtable operation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RetryPolicy {
     /// Total attempts, including the first request.
@@ -46,7 +46,7 @@ impl Default for RetryPolicy {
     }
 }
 
-/// Deadline settings for a `ReadRows` operation.
+/// Deadline settings for a high-level Bigtable operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeadlinePolicy {
     /// Maximum time for all attempts and backoff.
@@ -74,38 +74,61 @@ pub struct ReadOptions {
 }
 
 pub(crate) fn validate(options: &ReadOptions) -> Result<(), Error> {
-    if options.retry.max_attempts == 0 {
-        return Err(Error::invalid_read_policy(ReadPolicyIssue::ZeroMaxAttempts));
+    validate_policies(&options.retry, &options.deadlines)
+        .map_err(|issue| Error::invalid_read_policy(issue.into()))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PolicyIssue {
+    ZeroMaxAttempts,
+    ZeroInitialBackoff,
+    ZeroMaxBackoff,
+    MaxBackoffTooSmall,
+    InvalidBackoffMultiplier,
+    ZeroOperationTimeout,
+    ZeroAttemptTimeout,
+}
+
+pub(crate) fn validate_policies(
+    retry: &RetryPolicy,
+    deadlines: &DeadlinePolicy,
+) -> Result<(), PolicyIssue> {
+    if retry.max_attempts == 0 {
+        return Err(PolicyIssue::ZeroMaxAttempts);
     }
-    if options.retry.initial_backoff.is_zero() {
-        return Err(Error::invalid_read_policy(
-            ReadPolicyIssue::ZeroInitialBackoff,
-        ));
+    if retry.initial_backoff.is_zero() {
+        return Err(PolicyIssue::ZeroInitialBackoff);
     }
-    if options.retry.max_backoff.is_zero() {
-        return Err(Error::invalid_read_policy(ReadPolicyIssue::ZeroMaxBackoff));
+    if retry.max_backoff.is_zero() {
+        return Err(PolicyIssue::ZeroMaxBackoff);
     }
-    if options.retry.max_backoff < options.retry.initial_backoff {
-        return Err(Error::invalid_read_policy(
-            ReadPolicyIssue::MaxBackoffTooSmall,
-        ));
+    if retry.max_backoff < retry.initial_backoff {
+        return Err(PolicyIssue::MaxBackoffTooSmall);
     }
-    if !options.retry.multiplier.is_finite() || options.retry.multiplier < 1.0 {
-        return Err(Error::invalid_read_policy(
-            ReadPolicyIssue::InvalidBackoffMultiplier,
-        ));
+    if !retry.multiplier.is_finite() || retry.multiplier < 1.0 {
+        return Err(PolicyIssue::InvalidBackoffMultiplier);
     }
-    if options.deadlines.operation_timeout.is_zero() {
-        return Err(Error::invalid_read_policy(
-            ReadPolicyIssue::ZeroOperationTimeout,
-        ));
+    if deadlines.operation_timeout.is_zero() {
+        return Err(PolicyIssue::ZeroOperationTimeout);
     }
-    if options.deadlines.attempt_timeout.is_zero() {
-        return Err(Error::invalid_read_policy(
-            ReadPolicyIssue::ZeroAttemptTimeout,
-        ));
+    if deadlines.attempt_timeout.is_zero() {
+        return Err(PolicyIssue::ZeroAttemptTimeout);
     }
     Ok(())
+}
+
+impl From<PolicyIssue> for ReadPolicyIssue {
+    fn from(issue: PolicyIssue) -> Self {
+        match issue {
+            PolicyIssue::ZeroMaxAttempts => Self::ZeroMaxAttempts,
+            PolicyIssue::ZeroInitialBackoff => Self::ZeroInitialBackoff,
+            PolicyIssue::ZeroMaxBackoff => Self::ZeroMaxBackoff,
+            PolicyIssue::MaxBackoffTooSmall => Self::MaxBackoffTooSmall,
+            PolicyIssue::InvalidBackoffMultiplier => Self::InvalidBackoffMultiplier,
+            PolicyIssue::ZeroOperationTimeout => Self::ZeroOperationTimeout,
+            PolicyIssue::ZeroAttemptTimeout => Self::ZeroAttemptTimeout,
+        }
+    }
 }
 
 pub(crate) fn is_retryable(status: &Status) -> bool {
@@ -113,6 +136,10 @@ pub(crate) fn is_retryable(status: &Status) -> bool {
         status.code(),
         Code::Cancelled | Code::DeadlineExceeded | Code::Unavailable | Code::Aborted
     )
+}
+
+pub(crate) fn is_mutate_retryable(status: &Status) -> bool {
+    matches!(status.code(), Code::DeadlineExceeded | Code::Unavailable)
 }
 
 pub(crate) fn backoff(policy: &RetryPolicy, failed_attempt: u32) -> Duration {
@@ -158,8 +185,8 @@ mod tests {
     use tonic::{Code, Status};
 
     use super::{
-        DeadlinePolicy, Jitter, RETRY_INFO_TYPE, ReadOptions, RetryPolicy, backoff, is_retryable,
-        retry_delay, validate,
+        DeadlinePolicy, Jitter, RETRY_INFO_TYPE, ReadOptions, RetryPolicy, backoff,
+        is_mutate_retryable, is_retryable, retry_delay, validate,
     };
     use crate::{Error, ReadPolicyIssue};
 
@@ -230,6 +257,25 @@ mod tests {
             Code::Unauthenticated,
         ] {
             assert!(!is_retryable(&Status::new(code, "stop")));
+        }
+    }
+
+    #[test]
+    fn mutation_retry_codes_match_google_clients() {
+        for code in [Code::DeadlineExceeded, Code::Unavailable] {
+            assert!(is_mutate_retryable(&Status::new(code, "retry")));
+        }
+        for code in [
+            Code::Cancelled,
+            Code::Aborted,
+            Code::Internal,
+            Code::ResourceExhausted,
+            Code::InvalidArgument,
+            Code::NotFound,
+            Code::PermissionDenied,
+            Code::Unauthenticated,
+        ] {
+            assert!(!is_mutate_retryable(&Status::new(code, "stop")));
         }
     }
 

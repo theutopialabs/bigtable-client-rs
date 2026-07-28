@@ -2,10 +2,10 @@
 
 An async, production-focused Rust client for Google Cloud Bigtable.
 
-This project is under active development. M1 provides high-level row queries,
-streamed row assembly, safe retry resumption, deadline policies, and direct
-access to the generated Tonic client. The first supported version will be
-`0.0.1` after M5.
+This project is under active development. M2 provides high-level reads and
+writes, safe partial retries, bounded bulk requests, deadline policies, and
+direct access to the generated Tonic client. The first supported version will
+be `0.0.1` after M5.
 
 This crate is not published to crates.io.
 
@@ -20,7 +20,9 @@ This crate is not published to crates.io.
 | High-level row query API | Available | M1 |
 | Stateful streamed row assembly | Available | M1 |
 | Retry and deadline policies | Available | M1 |
-| Bulk mutations with partial retries | Planned | M2 |
+| Single-row and bulk mutations | Available | M2 |
+| Bounded bulk flow control | Available | M2 |
+| Partial mutation retries | Available | M2 |
 | Typed row mapping | Planned | M3 |
 | Tracing and OpenTelemetry | Planned | M4 |
 | Production hardening and `0.0.1` | Planned | M5 |
@@ -170,6 +172,117 @@ while let Some(row) = rows.next().await {
 Dropping `RowStream` cancels its background read task once the next row is
 ready to send.
 
+## Mutations
+
+Build one atomic row mutation from ordered cell and row changes:
+
+```rust,no_run
+use bigtable_client::{Client, Mutation, RowMutation};
+
+# async fn write(client: &Client) -> Result<(), bigtable_client::Error> {
+let row = RowMutation::new(b"user#42".to_vec())?
+    .mutation(Mutation::set_cell(
+        "profile",
+        b"name".to_vec(),
+        b"Ada".to_vec(),
+    )?)?
+    .mutation(Mutation::delete_cells(
+        "profile",
+        b"old_name".to_vec(),
+    )?)?;
+
+client.mutate_row("users", row).await?;
+# Ok(())
+# }
+```
+
+`Mutation` supports setting a cell, deleting all versions of a cell, deleting
+a timestamp range, deleting a family, and deleting a row. Use
+`Mutation::from_proto` for data API operations that do not have a builder yet.
+Row keys, qualifiers, and values accept binary data.
+
+Each `RowMutation` is atomic. Its changes run in order. Separate row entries
+may run in any order, including entries for the same row.
+
+Use `BulkMutation` to write many rows:
+
+```rust,no_run
+use bigtable_client::{BulkMutation, Client, Mutation, RowMutation};
+
+# async fn write(client: &Client) -> Result<(), bigtable_client::Error> {
+let first = RowMutation::new(b"user#1".to_vec())?
+    .mutation(Mutation::set_cell("profile", b"name".to_vec(), b"Ada".to_vec())?)?;
+let second = RowMutation::new(b"user#2".to_vec())?
+    .mutation(Mutation::set_cell("profile", b"name".to_vec(), b"Lin".to_vec())?)?;
+let bulk = BulkMutation::new("users")?
+    .entry(first)?
+    .entry(second)?;
+
+let result = client.mutate_rows(bulk).await?;
+println!(
+    "{} rows in {} request batches",
+    result.entries(),
+    result.request_batches(),
+);
+# Ok(())
+# }
+```
+
+Bulk mutation defaults are:
+
+| Setting | Default |
+| --- | --- |
+| Retryable gRPC codes | `DeadlineExceeded`, `Unavailable` |
+| Maximum attempts | `10` |
+| Initial backoff | `10ms` |
+| Backoff multiplier | `2` |
+| Maximum backoff | `60s` |
+| Jitter | Full |
+| Attempt timeout | `60s` |
+| Operation timeout | `10m` |
+| Entries per request | `100` |
+| Target encoded request size | `20 MiB` |
+| Requests in flight | `5` |
+
+`BulkMutationOptions` can change every value in this table. The request byte
+limit is a target. One larger row entry is sent by itself. The client also
+keeps each RPC below Bigtable's limit of 100,000 mutations.
+
+`Mutation::set_cell` records client time at millisecond precision. Its fixed
+timestamp makes a retry write the same cell version. Use
+`Mutation::set_cell_at_server_time` only when a new server timestamp is
+required. The client does not replay that entry after an ambiguous failure.
+Advanced aggregate mutations are retry safe only when the row has a stable
+idempotency token.
+
+The client retries only unresolved entries that are safe to replay. Confirmed
+entries are never sent again. If any entry still lacks a confirmed success,
+`Error::BulkMutation` reports the original entry indexes, attempts, retry
+safety, rich gRPC status, and partial success count:
+
+```rust,no_run
+use bigtable_client::{BulkMutation, Client, Error};
+
+# async fn write(
+#     client: &Client,
+#     bulk: BulkMutation,
+# ) -> Result<(), bigtable_client::Error> {
+match client.mutate_rows(bulk).await {
+    Ok(result) => println!("wrote {} rows", result.entries()),
+    Err(Error::BulkMutation(error)) => {
+        for failure in error.failures() {
+            eprintln!("entry {} failed: {}", failure.index(), failure.cause());
+        }
+    }
+    Err(error) => return Err(error),
+}
+# Ok(())
+# }
+```
+
+Dropping a bulk mutation future cancels active request streams and prevents new
+batches from starting.
+
 ## Raw Tonic client
 
 Use `Client::raw_client` for data API calls that do not have a high-level
@@ -297,18 +410,26 @@ cargo test --workspace --all-targets --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 ```
 
-The M1 suite also covers Google ReadRows chunk semantics, split cells across
+The M1 suite covers Google ReadRows chunk semantics, split cells across
 response messages, row resets, malformed streams, retry fault injection, scan
 markers, forward and reverse resume ranges, and deadline exhaustion.
+
+The M2 suite covers request count and byte splitting, bounded concurrency,
+atomic row changes, partial and streamed retry faults, rich status details,
+malformed response indexes, idempotency safety, cancellation, and live emulator
+writes and deletes.
 
 Every milestone must pass unit, public API, documentation, MSRV, release,
 package, and emulator tests before it is merged.
 
 ## Roadmap
 
-- M0: workspace, configuration, auth, channels, raw Tonic client, emulator CI
-- M1: row model, query builders, stream assembly, retry and deadline policies
-- M2: single-row and bulk mutations, flow control, partial retry handling
+- M0 complete: workspace, configuration, auth, channels, raw Tonic client,
+  emulator CI
+- M1 complete: row model, query builders, stream assembly, retry and deadline
+  policies
+- M2 complete: single-row and bulk mutations, bounded flow control, partial
+  retry handling
 - M3: typed row mapping and derive support
 - M4: tracing spans, OpenTelemetry metrics, request diagnostics
 - M5: compatibility review, stress tests, docs, and version `0.0.1`

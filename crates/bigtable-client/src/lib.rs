@@ -1,8 +1,8 @@
 //! An async Rust client for Google Cloud Bigtable.
 //!
-//! The high-level API provides row queries, streamed row assembly, retry
-//! resumption, and separate attempt and operation deadlines. The generated
-//! Tonic client remains available for direct data API calls.
+//! The high-level API provides row queries, streamed row assembly, atomic row
+//! mutations, bulk writes, partial retries, and operation deadlines. The
+//! generated Tonic client remains available for direct data API calls.
 //!
 //! # Quick start
 //!
@@ -29,18 +29,27 @@ mod client;
 mod config;
 mod error;
 mod merge;
+mod mutation;
 mod query;
 mod read;
+mod resource;
 mod retry;
 mod row;
+mod write;
 
 pub use client::{AuthInterceptor, Client, RawClient};
 pub use config::ClientConfig;
-pub use error::{ConfigField, ConfigIssue, Error, QueryIssue, ReadPolicyIssue, RowMergeIssue};
+pub use error::{
+    BulkMutationError, BulkMutationPolicyIssue, ConfigField, ConfigIssue, Error,
+    MutateRowsResponseIssue, MutationFailure, MutationFailureCause, MutationIssue, QueryIssue,
+    ReadPolicyIssue, RowMergeIssue,
+};
+pub use mutation::{BulkMutation, Mutation, RowMutation};
 pub use query::{Query, RowBound, RowRange};
 pub use read::RowStream;
 pub use retry::{DeadlinePolicy, Jitter, ReadOptions, RetryPolicy};
 pub use row::{Cell, Column, Family, Row};
+pub use write::{BatchPolicy, BulkMutationOptions, BulkMutationResult};
 
 /// Generated Google Cloud Bigtable v2 types and the raw Tonic client.
 pub use googleapis_tonic_google_bigtable_v2::google::bigtable::v2 as proto;

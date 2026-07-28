@@ -6,6 +6,7 @@ use crate::{
         ReadRowsRequest, RowFilter, RowSet,
         row_range::{EndKey, StartKey},
     },
+    resource::{TableIdIssue, table_name, validate_table_id},
 };
 
 /// One end of a row range.
@@ -80,15 +81,13 @@ impl Query {
     /// 50 characters, or contains `/`.
     pub fn new(table_id: impl Into<String>) -> Result<Self, Error> {
         let table_id = table_id.into();
-        if table_id.is_empty() {
-            return Err(Error::invalid_query(QueryIssue::EmptyTableId));
-        }
-        if table_id.chars().count() > 50 {
-            return Err(Error::invalid_query(QueryIssue::TableIdTooLong));
-        }
-        if table_id.contains('/') {
-            return Err(Error::invalid_query(QueryIssue::TableIdContainsSlash));
-        }
+        validate_table_id(&table_id).map_err(|issue| {
+            Error::invalid_query(match issue {
+                TableIdIssue::Empty => QueryIssue::EmptyTableId,
+                TableIdIssue::TooLong => QueryIssue::TableIdTooLong,
+                TableIdIssue::ContainsSlash => QueryIssue::TableIdContainsSlash,
+            })
+        })?;
 
         Ok(Self {
             table_id,
@@ -172,12 +171,7 @@ impl Query {
         };
 
         ReadRowsRequest {
-            table_name: format!(
-                "projects/{}/instances/{}/tables/{}",
-                config.project_id(),
-                config.instance_id(),
-                self.table_id
-            ),
+            table_name: table_name(config, &self.table_id),
             app_profile_id: config.app_profile_id().to_owned(),
             rows,
             filter: self.filter,
