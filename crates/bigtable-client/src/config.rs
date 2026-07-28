@@ -132,7 +132,7 @@ impl ClientConfig {
         Ok(self)
     }
 
-    /// Sets the default request timeout.
+    /// Sets the default high-level operation timeout.
     ///
     /// # Errors
     ///
@@ -198,7 +198,7 @@ impl ClientConfig {
         self.connect_timeout
     }
 
-    /// Returns the default request timeout.
+    /// Returns the default high-level operation timeout.
     #[must_use]
     pub const fn request_timeout(&self) -> Duration {
         self.request_timeout

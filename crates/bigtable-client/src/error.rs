@@ -271,7 +271,7 @@ pub enum ConfigField {
     ChannelPoolSize,
     /// The channel connection timeout.
     ConnectTimeout,
-    /// The default request timeout.
+    /// The default high-level operation timeout.
     RequestTimeout,
     /// The HTTP/2 keepalive interval.
     KeepAliveInterval,
@@ -320,7 +320,7 @@ impl fmt::Display for ConfigIssue {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigField, ConfigIssue, Error, QueryIssue, ReadPolicyIssue};
+    use super::{ConfigField, ConfigIssue, Error, QueryIssue, ReadPolicyIssue, RowMergeIssue};
 
     #[test]
     fn invalid_config_display_names_the_field_and_issue() {
@@ -396,6 +396,33 @@ mod tests {
         assert_eq!(
             Error::ChannelPoolClosed.to_string(),
             "failed to initialize the Bigtable channel pool"
+        );
+    }
+
+    #[test]
+    fn read_errors_include_attempt_and_recovery_context() {
+        let rpc = Error::ReadRows {
+            attempts: 3,
+            source: tonic::Status::unavailable("try later"),
+        };
+        let deadline = Error::ReadDeadlineExceeded {
+            attempts: 2,
+            timeout: std::time::Duration::from_secs(5),
+        };
+        let wire = Error::InvalidReadRowsResponse {
+            issue: RowMergeIssue::IncompleteRow,
+        };
+
+        let rpc_message = rpc.to_string();
+        assert!(rpc_message.starts_with("Bigtable ReadRows failed after 3 attempt(s):"));
+        assert!(rpc_message.contains("try later"));
+        assert_eq!(
+            deadline.to_string(),
+            "Bigtable ReadRows exceeded its 5s deadline after 2 attempt(s)"
+        );
+        assert_eq!(
+            wire.to_string(),
+            "invalid Bigtable ReadRows response: the response stream ended before commit_row"
         );
     }
 
@@ -496,6 +523,84 @@ mod tests {
             (
                 ReadPolicyIssue::DeadlineTooLarge,
                 "deadline is too large for the runtime clock",
+            ),
+        ];
+
+        for (issue, expected) in cases {
+            assert_eq!(issue.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn every_row_merge_issue_has_clear_guidance() {
+        let cases = [
+            (
+                RowMergeIssue::ResetBetweenRows,
+                "reset_row is not valid between rows",
+            ),
+            (
+                RowMergeIssue::MissingRowKey,
+                "a new row is missing its row key",
+            ),
+            (
+                RowMergeIssue::MissingFamily,
+                "a new row is missing its column family",
+            ),
+            (
+                RowMergeIssue::MissingQualifier,
+                "a new row is missing its column qualifier",
+            ),
+            (
+                RowMergeIssue::RowKeyChanged,
+                "the row key changed before commit_row",
+            ),
+            (
+                RowMergeIssue::FamilyWithoutQualifier,
+                "a new column family did not include a column qualifier",
+            ),
+            (
+                RowMergeIssue::OutOfOrderRowKey,
+                "row keys are not in strict query order",
+            ),
+            (
+                RowMergeIssue::ScanMarkerDuringRow,
+                "last_scanned_row_key appeared during an incomplete row",
+            ),
+            (
+                RowMergeIssue::ResetWithData,
+                "reset_row must not include cell data",
+            ),
+            (
+                RowMergeIssue::NegativeValueSize,
+                "value_size must not be negative",
+            ),
+            (
+                RowMergeIssue::SplitValueMissingData,
+                "a split cell must start with value bytes",
+            ),
+            (
+                RowMergeIssue::SplitValueTooLarge,
+                "a split cell exceeded its declared value_size",
+            ),
+            (
+                RowMergeIssue::CommitBeforeCellComplete,
+                "commit_row appeared before a split cell completed",
+            ),
+            (
+                RowMergeIssue::CellMetadataOnContinuation,
+                "a split cell continuation repeated cell metadata",
+            ),
+            (
+                RowMergeIssue::SplitValueSizeChanged,
+                "a split cell continuation changed its declared value_size",
+            ),
+            (
+                RowMergeIssue::SplitValueWrongSize,
+                "a split cell ended before reaching its declared value_size",
+            ),
+            (
+                RowMergeIssue::IncompleteRow,
+                "the response stream ended before commit_row",
             ),
         ];
 

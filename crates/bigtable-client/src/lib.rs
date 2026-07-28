@@ -1,28 +1,24 @@
 //! An async Rust client for Google Cloud Bigtable.
 //!
-//! M0 provides configuration, application default credentials, pooled Tonic
-//! channels, emulator support, and access to the generated Bigtable client.
+//! The high-level API provides row queries, streamed row assembly, retry
+//! resumption, and separate attempt and operation deadlines. The generated
+//! Tonic client remains available for direct data API calls.
 //!
 //! # Quick start
 //!
 //! ```no_run
-//! use bigtable_client::{Client, ClientConfig, proto::PingAndWarmRequest};
-//! use tonic::Request;
+//! use bigtable_client::{Client, ClientConfig, Query};
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let config = ClientConfig::new("my-project", "my-instance")?;
 //! let client = Client::connect(config).await?;
-//! let mut raw = client.raw_client();
-//!
-//! let mut request = Request::new(PingAndWarmRequest {
-//!     name: "projects/my-project/instances/my-instance".to_owned(),
-//!     app_profile_id: "default".to_owned(),
-//! });
-//! request.metadata_mut().insert(
-//!     "x-goog-request-params",
-//!     "name=projects/my-project/instances/my-instance".parse()?,
-//! );
-//! raw.ping_and_warm(request).await?;
+//! let query = Query::new("events")?
+//!     .prefix(b"user#".to_vec())
+//!     .limit(100)?;
+//! let mut rows = client.read_rows(query).await?;
+//! while let Some(row) = rows.next().await {
+//!     println!("{:?}", row?.key);
+//! }
 //! # Ok(())
 //! # }
 //! ```
