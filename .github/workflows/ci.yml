@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+  RUSTDOCFLAGS: -Dwarnings
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo check --workspace --all-targets --all-features
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-targets --all-features
+      - run: cargo test --workspace --doc --all-features
+      - run: cargo doc --workspace --all-features --no-deps
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --all-features
+
+  emulator:
+    name: Bigtable emulator
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Start emulator
+        run: |
+          docker run --detach --name bigtable-emulator \
+            --publish 127.0.0.1:8086:8086 \
+            gcr.io/google.com/cloudsdktool/google-cloud-cli:574.0.0-emulators \
+            gcloud beta emulators bigtable start --host-port=0.0.0.0:8086
+          for attempt in {1..60}; do
+            if (echo > /dev/tcp/127.0.0.1/8086) 2>/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs bigtable-emulator
+          exit 1
+      - name: Test emulator
+        env:
+          BIGTABLE_EMULATOR_HOST: 127.0.0.1:8086
+          RUN_BIGTABLE_EMULATOR_TESTS: "1"
+        run: cargo test --workspace --features emulator-tests --test emulator -- --nocapture
+      - name: Show emulator logs
+        if: failure()
+        run: docker logs bigtable-emulator

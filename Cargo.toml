@@ -1,0 +1,36 @@
+[workspace]
+members = ["crates/bigtable-client"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/theutopialabs/bigtable-client-rs"
+
+[workspace.dependencies]
+arc-swap = "1.9.0"
+async-trait = "0.1.89"
+base64 = "0.22.1"
+figment = { version = "0.10.19", features = ["env"] }
+gcp_auth = { version = "0.12.7", default-features = false, features = ["ring", "webpki-roots"] }
+googleapis-tonic-google-bigtable-v2 = { version = "0.39.0", default-features = false, features = ["bytes", "hash-map"] }
+googleapis-tonic-google-bigtable-admin-v2 = { version = "0.45.0", default-features = false, features = ["bytes", "hash-map"] }
+http = "1.4.0"
+humantime-serde = "1.1.1"
+prost = "0.14.3"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.17"
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tonic = { version = "0.14.2", features = ["gzip", "tls-ring", "tls-webpki-roots"] }
+tracing = "0.1.41"
+
+[workspace.lints.rust]
+missing_docs = "deny"
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"

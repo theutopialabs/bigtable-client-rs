@@ -1,0 +1,39 @@
+[package]
+name = "bigtable-client"
+description = "An async Rust client for Google Cloud Bigtable"
+readme = "../../README.md"
+keywords = ["bigtable", "gcp", "grpc", "tonic", "database"]
+categories = ["api-bindings", "asynchronous", "database"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+emulator-tests = []
+
+[dependencies]
+arc-swap.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+figment.workspace = true
+gcp_auth.workspace = true
+googleapis-tonic-google-bigtable-v2.workspace = true
+http.workspace = true
+humantime-serde.workspace = true
+prost.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+figment = { workspace = true, features = ["test"] }
+googleapis-tonic-google-bigtable-admin-v2.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
