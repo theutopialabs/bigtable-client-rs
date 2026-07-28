@@ -993,6 +993,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "run serially because tracing callsite interest is process-wide"]
     fn attempt_spans_are_children_of_operation_spans() {
         let layer = SpanTree::default();
         let spans = Arc::clone(&layer.spans);

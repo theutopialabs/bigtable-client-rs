@@ -1511,6 +1511,60 @@ mod tests {
         assert_eq!(result.request_batches(), 3);
     }
 
+    #[tokio::test(start_paused = true)]
+    #[ignore = "run through the dedicated stress test gate"]
+    async fn large_bulk_write_splits_and_retries_partial_results() {
+        const BATCHES: usize = 10;
+        const ENTRIES_PER_BATCH: usize = 1_000;
+        const ENTRIES: usize = BATCHES * ENTRIES_PER_BATCH;
+
+        let partial = || {
+            Script::Stream(vec![Ok(response((0..ENTRIES_PER_BATCH).map(|index| {
+                let status = if index % 2 == 0 {
+                    rpc_status(Code::Unavailable, "retry")
+                } else {
+                    rpc_status(Code::Ok, "")
+                };
+                (i64::try_from(index).expect("small index"), Some(status))
+            })))])
+        };
+        let mut scripts = Vec::with_capacity(BATCHES * 2);
+        for _ in 0..BATCHES {
+            scripts.push(partial());
+            scripts.push(Script::SuccessAll);
+        }
+        let service = Arc::new(FakeService::new(scripts));
+        let mut stress_options = options();
+        stress_options.batch.max_entries_per_request = ENTRIES_PER_BATCH;
+        stress_options.batch.max_in_flight_requests = 1;
+        let result = execute_with_service(
+            service.clone(),
+            &config(),
+            bulk((0..ENTRIES).map(|index| safe_row(format!("row-{index:05}").into_bytes()))),
+            stress_options,
+        )
+        .await
+        .expect("all partial batches recover");
+
+        assert_eq!(result.entries(), ENTRIES);
+        assert_eq!(result.request_batches(), BATCHES);
+        assert_eq!(
+            result.rpc_attempts(),
+            u32::try_from(BATCHES * 2).expect("small attempt count")
+        );
+        let request_sizes = service
+            .requests
+            .lock()
+            .await
+            .iter()
+            .map(|request| request.message.entries.len())
+            .collect::<Vec<_>>();
+        assert_eq!(request_sizes.len(), BATCHES * 2);
+        for sizes in request_sizes.chunks_exact(2) {
+            assert_eq!(sizes, [ENTRIES_PER_BATCH, ENTRIES_PER_BATCH / 2]);
+        }
+    }
+
     #[test]
     fn batching_never_exceeds_the_api_mutation_count() {
         let many = |key: &'static [u8], count| {

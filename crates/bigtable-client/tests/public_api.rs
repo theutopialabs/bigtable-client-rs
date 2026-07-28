@@ -74,6 +74,36 @@ fn public_config_api_builds_a_valid_emulator_target() {
 }
 
 #[test]
+fn package_version_and_service_limit_errors_are_public() {
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.0.1");
+
+    let config_error = ClientConfig::new("project", "instance")
+        .expect("valid IDs")
+        .with_app_profile_id("a".repeat(51))
+        .expect_err("oversized app profile");
+    assert!(matches!(
+        config_error,
+        Error::InvalidConfig {
+            field: ConfigField::AppProfileId,
+            issue: ConfigIssue::TooLong { max_chars: 50 },
+        }
+    ));
+
+    let mutation_error =
+        Mutation::delete_family("a".repeat(65)).expect_err("oversized column family");
+    assert!(matches!(
+        mutation_error,
+        Error::InvalidMutation {
+            issue: MutationIssue::FamilyNameTooLong,
+        }
+    ));
+    assert_eq!(
+        QueryIssue::RowKeyTooLong.to_string(),
+        "row keys and range bounds must not exceed 4 KiB"
+    );
+}
+
+#[test]
 fn public_errors_can_be_matched_without_string_parsing() {
     let error = ClientConfig::new("", "instance").expect_err("project ID is required");
 

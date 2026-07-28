@@ -14,6 +14,7 @@ use crate::{
 };
 
 const MAX_ROW_KEY_BYTES: usize = 4 * 1024;
+const MAX_FAMILY_NAME_CHARS: usize = 64;
 const MAX_MUTATIONS_PER_ENTRY: usize = 100_000;
 const MIN_IDEMPOTENCY_TOKEN_BYTES: usize = 8;
 
@@ -402,6 +403,9 @@ fn valid_family_name(family_name: String) -> Result<String, Error> {
     if family_name.is_empty() {
         return Err(Error::invalid_mutation(MutationIssue::EmptyFamilyName));
     }
+    if family_name.chars().count() > MAX_FAMILY_NAME_CHARS {
+        return Err(Error::invalid_mutation(MutationIssue::FamilyNameTooLong));
+    }
     if !family_name
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
@@ -446,6 +450,12 @@ mod tests {
             Mutation::set_cell_at("", Bytes::new(), 0, Bytes::new()),
             Err(Error::InvalidMutation {
                 issue: MutationIssue::EmptyFamilyName
+            })
+        ));
+        assert!(matches!(
+            Mutation::set_cell_at("a".repeat(65), Bytes::new(), 0, Bytes::new()),
+            Err(Error::InvalidMutation {
+                issue: MutationIssue::FamilyNameTooLong
             })
         ));
         assert!(matches!(

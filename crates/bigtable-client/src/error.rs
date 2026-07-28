@@ -608,6 +608,8 @@ pub enum MutationIssue {
     RowKeyTooLong,
     /// A column family name is empty.
     EmptyFamilyName,
+    /// A column family name exceeds Bigtable's 64-character limit.
+    FamilyNameTooLong,
     /// A column family name contains an unsupported byte.
     InvalidFamilyName,
     /// A cell timestamp is negative.
@@ -639,6 +641,7 @@ impl fmt::Display for MutationIssue {
             Self::EmptyRowKey => "row key must not be empty",
             Self::RowKeyTooLong => "row key must not exceed 4 KiB",
             Self::EmptyFamilyName => "family_name must not be empty",
+            Self::FamilyNameTooLong => "family_name must not exceed 64 characters",
             Self::InvalidFamilyName => {
                 "family_name may contain only ASCII letters, digits, '-', '_', and '.'"
             }
@@ -665,6 +668,10 @@ pub enum QueryIssue {
     TableIdTooLong,
     /// The table ID contains a resource path separator.
     TableIdContainsSlash,
+    /// An exact row key is empty.
+    EmptyRowKey,
+    /// A row key or range bound exceeds Bigtable's 4 KiB limit.
+    RowKeyTooLong,
     /// A row limit is zero.
     ZeroRowLimit,
     /// A row limit is larger than the API can represent.
@@ -677,6 +684,8 @@ impl fmt::Display for QueryIssue {
             Self::EmptyTableId => "table_id must not be empty",
             Self::TableIdTooLong => "table_id must not exceed 50 characters",
             Self::TableIdContainsSlash => "table_id must not contain '/'",
+            Self::EmptyRowKey => "exact row keys must not be empty",
+            Self::RowKeyTooLong => "row keys and range bounds must not exceed 4 KiB",
             Self::ZeroRowLimit => "row limit must be greater than zero",
             Self::RowLimitTooLarge => "row limit must fit in a signed 64-bit integer",
         })
@@ -771,6 +780,11 @@ impl fmt::Display for ConfigField {
 pub enum ConfigIssue {
     /// The value is empty.
     Empty,
+    /// The value exceeds a service character limit.
+    TooLong {
+        /// Maximum accepted characters.
+        max_chars: usize,
+    },
     /// The value is not a valid absolute HTTP or HTTPS URI.
     InvalidUri,
     /// The number must be greater than zero.
@@ -779,11 +793,14 @@ pub enum ConfigIssue {
 
 impl fmt::Display for ConfigIssue {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Empty => "must not be empty",
-            Self::InvalidUri => "must be an absolute HTTP or HTTPS URI",
-            Self::MustBePositive => "must be greater than zero",
-        })
+        match self {
+            Self::Empty => formatter.write_str("must not be empty"),
+            Self::TooLong { max_chars } => {
+                write!(formatter, "must not exceed {max_chars} characters")
+            }
+            Self::InvalidUri => formatter.write_str("must be an absolute HTTP or HTTPS URI"),
+            Self::MustBePositive => formatter.write_str("must be greater than zero"),
+        }
     }
 }
 
@@ -824,6 +841,7 @@ mod tests {
             MutationIssue::EmptyRowKey,
             MutationIssue::RowKeyTooLong,
             MutationIssue::EmptyFamilyName,
+            MutationIssue::FamilyNameTooLong,
             MutationIssue::InvalidFamilyName,
             MutationIssue::NegativeTimestamp,
             MutationIssue::TimestampNotMillisecondAligned,
@@ -1034,6 +1052,10 @@ mod tests {
         let cases = [
             (ConfigIssue::Empty, "must not be empty"),
             (
+                ConfigIssue::TooLong { max_chars: 50 },
+                "must not exceed 50 characters",
+            ),
+            (
                 ConfigIssue::InvalidUri,
                 "must be an absolute HTTP or HTTPS URI",
             ),
@@ -1056,6 +1078,11 @@ mod tests {
             (
                 QueryIssue::TableIdContainsSlash,
                 "table_id must not contain '/'",
+            ),
+            (QueryIssue::EmptyRowKey, "exact row keys must not be empty"),
+            (
+                QueryIssue::RowKeyTooLong,
+                "row keys and range bounds must not exceed 4 KiB",
             ),
             (
                 QueryIssue::ZeroRowLimit,

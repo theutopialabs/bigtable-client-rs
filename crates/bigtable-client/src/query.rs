@@ -9,6 +9,8 @@ use crate::{
     resource::{TableIdIssue, table_name, validate_table_id},
 };
 
+const MAX_ROW_KEY_BYTES: usize = 4 * 1024;
+
 /// One end of a row range.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RowBound {
@@ -164,6 +166,20 @@ impl Query {
         &self.table_id
     }
 
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        for key in &self.row_keys {
+            if key.is_empty() {
+                return Err(Error::invalid_query(QueryIssue::EmptyRowKey));
+            }
+            validate_key_size(key)?;
+        }
+        for range in &self.row_ranges {
+            validate_bound_size(&range.start)?;
+            validate_bound_size(&range.end)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn into_request(self, config: &ClientConfig) -> ReadRowsRequest {
         let rows = if self.row_keys.is_empty() && self.row_ranges.is_empty() {
             None
@@ -184,6 +200,20 @@ impl Query {
             ..ReadRowsRequest::default()
         }
     }
+}
+
+fn validate_bound_size(bound: &RowBound) -> Result<(), Error> {
+    match bound {
+        RowBound::Unbounded => Ok(()),
+        RowBound::Inclusive(key) | RowBound::Exclusive(key) => validate_key_size(key),
+    }
+}
+
+fn validate_key_size(key: &Bytes) -> Result<(), Error> {
+    if key.len() > MAX_ROW_KEY_BYTES {
+        return Err(Error::invalid_query(QueryIssue::RowKeyTooLong));
+    }
+    Ok(())
 }
 
 fn prefix_successor(prefix: &Bytes) -> Option<Bytes> {
@@ -375,5 +405,51 @@ mod tests {
                 issue: QueryIssue::RowLimitTooLarge
             }
         ));
+    }
+
+    #[test]
+    fn invalid_read_keys_return_typed_errors() {
+        let empty = Query::new("table")
+            .expect("valid table")
+            .row_key(Bytes::new())
+            .validate()
+            .expect_err("empty exact key");
+        let long_key = Bytes::from(vec![0; 4 * 1024 + 1]);
+        let exact = Query::new("table")
+            .expect("valid table")
+            .row_key(long_key.clone())
+            .validate()
+            .expect_err("oversized exact key");
+        let range = Query::new("table")
+            .expect("valid table")
+            .row_range(RowRange::new(
+                RowBound::Unbounded,
+                RowBound::exclusive(long_key),
+            ))
+            .validate()
+            .expect_err("oversized range bound");
+
+        assert!(matches!(
+            empty,
+            Error::InvalidQuery {
+                issue: QueryIssue::EmptyRowKey
+            }
+        ));
+        for error in [exact, range] {
+            assert!(matches!(
+                error,
+                Error::InvalidQuery {
+                    issue: QueryIssue::RowKeyTooLong
+                }
+            ));
+        }
+        Query::new("table")
+            .expect("valid table")
+            .row_range(RowRange::new(
+                RowBound::inclusive(Bytes::new()),
+                RowBound::Unbounded,
+            ))
+            .validate()
+            .expect("empty range bound stays valid");
     }
 }

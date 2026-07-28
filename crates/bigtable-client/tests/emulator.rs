@@ -21,6 +21,7 @@ use bigtable_client::{
         read_rows_response::{CellChunk, cell_chunk::RowStatus},
     },
 };
+use futures_util::{StreamExt as _, stream};
 use googleapis_tonic_google_bigtable_admin_v2::google::bigtable::admin::v2::{
     ColumnFamily, CreateTableRequest, DeleteTableRequest, Table,
     bigtable_table_admin_client::BigtableTableAdminClient,
@@ -210,6 +211,8 @@ async fn raw_and_high_level_clients_cover_reads_and_bulk_mutations() {
         .await
         .expect("single-row mutation succeeds");
     write_typed_fixture(&client, &table_id).await;
+    let stress_result = write_stress_fixture(&client, &table_id).await;
+    let stress_rows = read_stress_fixture(&client, &table_id).await;
 
     let raw_chunks = raw_read(&mut raw, &table_name, b"row-raw").await;
     let row_one = read_required(&client, &table_id, b"row-1").await;
@@ -251,6 +254,7 @@ async fn raw_and_high_level_clients_cover_reads_and_bulk_mutations() {
     assert_eq!(result.entries(), 4);
     assert_eq!(result.request_batches(), 4);
     assert_eq!(result.rpc_attempts(), 4);
+    assert_stress_results(stress_result, stress_rows);
     assert_raw_row(&raw_chunks, b"row-raw", b"raw value");
     assert_eq!(cell_value(&row_one), b"first value");
     assert_eq!(cell_value(&row_two), b"\x00\xffsecond");
@@ -282,6 +286,61 @@ async fn raw_and_high_level_clients_cover_reads_and_bulk_mutations() {
     );
 
     observability.assert_finished();
+}
+
+fn assert_stress_results(result: bigtable_client::BulkMutationResult, rows: Vec<(usize, Vec<u8>)>) {
+    assert_eq!(result.entries(), 256);
+    assert_eq!(result.request_batches(), 8);
+    assert_eq!(result.rpc_attempts(), 8);
+    assert_eq!(rows.len(), 256);
+    for (index, value) in rows {
+        assert_eq!(value, format!("value-{index:03}").into_bytes());
+    }
+}
+
+async fn write_stress_fixture(
+    client: &Client,
+    table_id: &str,
+) -> bigtable_client::BulkMutationResult {
+    let mut bulk = BulkMutation::new(table_id).expect("valid table");
+    for index in 0..256 {
+        let row_key = format!("stress-{index:03}").into_bytes();
+        let value = format!("value-{index:03}").into_bytes();
+        bulk.push(set_row(&row_key, &value).expect("valid stress row"))
+            .expect("nonempty row");
+    }
+    let options = BulkMutationOptions {
+        batch: BatchPolicy {
+            max_entries_per_request: 32,
+            max_request_bytes: 4 * 1024 * 1024,
+            max_in_flight_requests: 4,
+        },
+        ..BulkMutationOptions::default()
+    };
+
+    client
+        .mutate_rows_with_options(bulk, options)
+        .await
+        .expect("stress bulk mutation succeeds")
+}
+
+async fn read_stress_fixture(client: &Client, table_id: &str) -> Vec<(usize, Vec<u8>)> {
+    let table_id = table_id.to_owned();
+    let mut rows = stream::iter(0..256)
+        .map(|index| {
+            let client = client.clone();
+            let table_id = table_id.clone();
+            async move {
+                let key = format!("stress-{index:03}").into_bytes();
+                let row = read_required(&client, &table_id, &key).await;
+                (index, cell_value(&row).to_vec())
+            }
+        })
+        .buffer_unordered(32)
+        .collect::<Vec<_>>()
+        .await;
+    rows.sort_by_key(|(index, _)| *index);
+    rows
 }
 
 async fn write_typed_fixture(client: &Client, table_id: &str) {

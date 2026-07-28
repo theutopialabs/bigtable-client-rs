@@ -109,6 +109,7 @@ async fn start_with_service_and_telemetry(
     options: ReadOptions,
 ) -> Result<RowStream, Error> {
     retry::validate(&options)?;
+    query.validate()?;
     let table_id = query.table_id().to_owned();
     let request = query.into_request(config);
     let routing = format!("table_name={}", request.table_name)
@@ -736,6 +737,22 @@ mod tests {
         }
     }
 
+    fn owned_row_response(key: Bytes, value: Bytes) -> ReadRowsResponse {
+        ReadRowsResponse {
+            chunks: vec![CellChunk {
+                row_key: key,
+                family_name: Some("f".to_owned()),
+                qualifier: Some(b"q".to_vec()),
+                timestamp_micros: 1,
+                labels: Vec::new(),
+                value,
+                value_size: 0,
+                row_status: Some(RowStatus::CommitRow(true)),
+            }],
+            ..ReadRowsResponse::default()
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn read_stream_merges_chunks_across_response_messages() {
         let service = Arc::new(FakeService::new([Script::Stream(vec![
@@ -773,6 +790,121 @@ mod tests {
         let row = stream.next().await.expect("one result").expect("valid row");
         assert_eq!(row.families[0].columns[0].cells[0].value.as_ref(), b"abcd");
         assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "run through the dedicated stress test gate"]
+    async fn large_stream_keeps_every_row_in_order() {
+        const ROWS: usize = 10_000;
+
+        let responses = (0..ROWS)
+            .map(|index| {
+                Ok(owned_row_response(
+                    Bytes::from(format!("row-{index:05}")),
+                    Bytes::from(index.to_string()),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let service = Arc::new(FakeService::new([Script::Stream(responses)]));
+        let mut stream = start_with_service(
+            service.clone(),
+            &config(),
+            Query::new("table").expect("valid query"),
+            options(),
+        )
+        .await
+        .expect("read starts");
+
+        for index in 0..ROWS {
+            let row = stream.next().await.expect("row result").expect("valid row");
+            assert_eq!(row.key, Bytes::from(format!("row-{index:05}")));
+            assert_eq!(
+                row.families[0].columns[0].cells[0].value,
+                Bytes::from(index.to_string())
+            );
+        }
+        assert!(stream.next().await.is_none());
+        assert_eq!(service.requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "run through the dedicated stress test gate"]
+    async fn large_split_cell_merges_across_many_messages() {
+        const CHUNKS: usize = 4_096;
+        const CHUNK_BYTES: usize = 256;
+
+        let mut responses = Vec::with_capacity(CHUNKS);
+        for index in 0..CHUNKS {
+            let first = index == 0;
+            let last = index + 1 == CHUNKS;
+            responses.push(Ok(ReadRowsResponse {
+                chunks: vec![CellChunk {
+                    row_key: if first {
+                        Bytes::from_static(b"large")
+                    } else {
+                        Bytes::new()
+                    },
+                    family_name: first.then(|| "f".to_owned()),
+                    qualifier: first.then(|| b"q".to_vec()),
+                    timestamp_micros: i64::from(first),
+                    labels: Vec::new(),
+                    value: Bytes::from(vec![
+                        u8::try_from(index % 251).expect("small byte");
+                        CHUNK_BYTES
+                    ]),
+                    value_size: if last {
+                        0
+                    } else {
+                        i32::try_from(CHUNKS * CHUNK_BYTES).expect("small cell")
+                    },
+                    row_status: last.then_some(RowStatus::CommitRow(true)),
+                }],
+                ..ReadRowsResponse::default()
+            }));
+        }
+        let service = Arc::new(FakeService::new([Script::Stream(responses)]));
+        let mut stream = start_with_service(
+            service,
+            &config(),
+            Query::new("table").expect("valid query"),
+            options(),
+        )
+        .await
+        .expect("read starts");
+
+        let row = stream.next().await.expect("row result").expect("valid row");
+        let value = &row.families[0].columns[0].cells[0].value;
+        assert_eq!(value.len(), CHUNKS * CHUNK_BYTES);
+        for index in [0, 1, 1_024, CHUNKS - 1] {
+            assert_eq!(
+                value[index * CHUNK_BYTES],
+                u8::try_from(index % 251).expect("small byte")
+            );
+        }
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_query_stops_before_the_first_rpc() {
+        let service = Arc::new(FakeService::default());
+        let error = start_with_service(
+            service.clone(),
+            &config(),
+            Query::new("table")
+                .expect("valid table")
+                .row_key(Bytes::new()),
+            options(),
+        )
+        .await
+        .expect_err("empty exact key");
+
+        assert!(matches!(
+            error,
+            Error::InvalidQuery {
+                issue: crate::QueryIssue::EmptyRowKey
+            }
+        ));
+        assert!(service.requests.lock().await.is_empty());
     }
 
     #[tokio::test(start_paused = true)]

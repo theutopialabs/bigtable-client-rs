@@ -20,7 +20,7 @@ opentelemetry = ["dep:opentelemetry"]
 arc-swap.workspace = true
 async-trait.workspace = true
 base64.workspace = true
-bigtable-client-derive = { version = "=0.0.0", path = "../bigtable-client-derive" }
+bigtable-client-derive = { version = "=0.0.1", path = "../bigtable-client-derive" }
 bytes.workspace = true
 fastrand.workspace = true
 figment.workspace = true
