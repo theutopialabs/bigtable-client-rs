@@ -1,4 +1,4 @@
-//! An async Rust client for Google Cloud Bigtable.
+#![doc = include_str!("../../../README.md")]
 
 mod auth;
 mod channel;
