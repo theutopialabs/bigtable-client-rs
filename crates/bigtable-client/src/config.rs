@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::{ConfigField, ConfigIssue, Error};
 
 const DEFAULT_APP_PROFILE_ID: &str = "default";
+const MAX_APP_PROFILE_ID_CHARS: usize = 50;
 const DEFAULT_ENDPOINT: &str = "https://bigtable.googleapis.com";
 const DEFAULT_CHANNEL_POOL_SIZE: usize = 1;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -74,9 +75,14 @@ impl ClientConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidConfig`] when the ID is empty.
+    /// Returns [`Error::InvalidConfig`] when the ID is empty or longer than 50
+    /// characters.
     pub fn with_app_profile_id(mut self, app_profile_id: impl Into<String>) -> Result<Self, Error> {
-        self.app_profile_id = non_empty(&app_profile_id.into(), ConfigField::AppProfileId)?;
+        self.app_profile_id = non_empty_with_max_chars(
+            &app_profile_id.into(),
+            ConfigField::AppProfileId,
+            MAX_APP_PROFILE_ID_CHARS,
+        )?;
         Ok(self)
     }
 
@@ -270,7 +276,11 @@ impl TryFrom<RawConfig> for ClientConfig {
     fn try_from(raw: RawConfig) -> Result<Self, Self::Error> {
         let project_id = non_empty(&raw.project_id, ConfigField::ProjectId)?;
         let instance_id = non_empty(&raw.instance_id, ConfigField::InstanceId)?;
-        let app_profile_id = non_empty(&raw.app_profile_id, ConfigField::AppProfileId)?;
+        let app_profile_id = non_empty_with_max_chars(
+            &raw.app_profile_id,
+            ConfigField::AppProfileId,
+            MAX_APP_PROFILE_ID_CHARS,
+        )?;
         let endpoint = valid_uri(&raw.endpoint, ConfigField::Endpoint)?;
         let emulator_host = raw
             .emulator_host
@@ -310,6 +320,21 @@ fn non_empty(value: &str, field: ConfigField) -> Result<String, Error> {
         return Err(Error::invalid_config(field, ConfigIssue::Empty));
     }
     Ok(trimmed.to_owned())
+}
+
+fn non_empty_with_max_chars(
+    value: &str,
+    field: ConfigField,
+    max_chars: usize,
+) -> Result<String, Error> {
+    let value = non_empty(value, field)?;
+    if value.chars().count() > max_chars {
+        return Err(Error::invalid_config(
+            field,
+            ConfigIssue::TooLong { max_chars },
+        ));
+    }
+    Ok(value)
 }
 
 fn valid_uri(value: &str, field: ConfigField) -> Result<String, Error> {
@@ -479,6 +504,19 @@ mod tests {
         for (result, field) in &cases {
             assert_invalid(result, *field, ConfigIssue::Empty);
         }
+    }
+
+    #[test]
+    fn oversized_app_profile_id_is_rejected() {
+        let result = ClientConfig::new("project", "instance")
+            .expect("valid config")
+            .with_app_profile_id("a".repeat(51));
+
+        assert_invalid(
+            &result,
+            ConfigField::AppProfileId,
+            ConfigIssue::TooLong { max_chars: 50 },
+        );
     }
 
     #[test]
