@@ -9,6 +9,13 @@ rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/theutopialabs/bigtable-client-rs"
 
+[workspace.dependencies]
+figment = { version = "0.10.19", features = ["env"] }
+http = "1.4.0"
+humantime-serde = "1.1.1"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.17"
+
 [workspace.lints.rust]
 missing_docs = "deny"
 unsafe_code = "deny"
@@ -17,4 +24,3 @@ unsafe_code = "deny"
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 module_name_repetitions = "allow"
-
