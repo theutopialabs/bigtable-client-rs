@@ -103,9 +103,9 @@ async fn start_with_service(
     retry::validate(&options)?;
     let request = query.into_request(config);
     let mut operation = ReadOperation::new(service, request, options)?;
-    let active = match operation.open(None).await? {
+    let active = match operation.open(None, None).await? {
         OpenResult::Active(active) => active,
-        OpenResult::Complete => {
+        OpenResult::Complete | OpenResult::Cancelled => {
             let (_sender, receiver) = mpsc::channel(1);
             return Ok(RowStream {
                 inner: ReceiverStream::new(receiver),
@@ -140,6 +140,7 @@ struct ActiveAttempt {
 enum OpenResult {
     Active(ActiveAttempt),
     Complete,
+    Cancelled,
 }
 
 impl ReadOperation {
@@ -175,7 +176,10 @@ impl ReadOperation {
     async fn run(mut self, mut active: ActiveAttempt, sender: mpsc::Sender<Result<Row, Error>>) {
         loop {
             let message_deadline = active.deadline.min(self.deadline);
-            let next = timeout_at(message_deadline, active.stream.next()).await;
+            let next = tokio::select! {
+                () = sender.closed() => return,
+                next = timeout_at(message_deadline, active.stream.next()) => next,
+            };
             match next {
                 Ok(Some(Ok(response))) => match self.handle_response(response, &sender).await {
                     Ok(true) => {}
@@ -193,9 +197,9 @@ impl ReadOperation {
                 }
                 Ok(Some(Err(status))) => {
                     self.merger.discard_partial();
-                    match self.open(Some(status)).await {
+                    match self.open(Some(status), Some(&sender)).await {
                         Ok(OpenResult::Active(next_attempt)) => active = next_attempt,
-                        Ok(OpenResult::Complete) => return,
+                        Ok(OpenResult::Complete | OpenResult::Cancelled) => return,
                         Err(error) => {
                             send_terminal(&sender, error).await;
                             return;
@@ -205,9 +209,9 @@ impl ReadOperation {
                 Err(_) => {
                     self.merger.discard_partial();
                     let status = Status::deadline_exceeded("ReadRows attempt deadline exceeded");
-                    match self.open(Some(status)).await {
+                    match self.open(Some(status), Some(&sender)).await {
                         Ok(OpenResult::Active(next_attempt)) => active = next_attempt,
-                        Ok(OpenResult::Complete) => return,
+                        Ok(OpenResult::Complete | OpenResult::Cancelled) => return,
                         Err(error) => {
                             send_terminal(&sender, error).await;
                             return;
@@ -246,7 +250,11 @@ impl ReadOperation {
         Ok(true)
     }
 
-    async fn open(&mut self, mut failure: Option<Status>) -> Result<OpenResult, Error> {
+    async fn open(
+        &mut self,
+        mut failure: Option<Status>,
+        sender: Option<&mpsc::Sender<Result<Row, Error>>>,
+    ) -> Result<OpenResult, Error> {
         loop {
             if Instant::now() >= self.deadline {
                 return Err(self.deadline_error());
@@ -271,7 +279,14 @@ impl ReadOperation {
                     delay_ms = delay.as_millis(),
                     "retrying Bigtable ReadRows"
                 );
-                tokio::time::sleep(delay).await;
+                if let Some(sender) = sender {
+                    tokio::select! {
+                        () = sender.closed() => return Ok(OpenResult::Cancelled),
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                } else {
+                    tokio::time::sleep(delay).await;
+                }
             }
 
             let Some(message) =
@@ -292,7 +307,16 @@ impl ReadOperation {
             request.set_timeout(attempt_timeout);
             self.attempts += 1;
 
-            match timeout(attempt_timeout, self.service.read_rows(request)).await {
+            let attempt = timeout(attempt_timeout, self.service.read_rows(request));
+            let result = if let Some(sender) = sender {
+                tokio::select! {
+                    () = sender.closed() => return Ok(OpenResult::Cancelled),
+                    result = attempt => result,
+                }
+            } else {
+                attempt.await
+            };
+            match result {
                 Ok(Ok(stream)) => {
                     return Ok(OpenResult::Active(ActiveAttempt {
                         stream,
@@ -439,10 +463,20 @@ fn end_at_or_after(end: Option<&EndKey>, key: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::Arc, time::Duration};
+    use std::{
+        collections::VecDeque,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        task::{Context, Poll},
+        time::Duration,
+    };
 
     use async_trait::async_trait;
     use bytes::Bytes;
+    use futures_core::Stream;
     use tokio::sync::Mutex;
     use tonic::{Code, Request, Status};
 
@@ -463,6 +497,7 @@ mod tests {
         StartError(Status),
         Stream(Vec<Result<ReadRowsResponse, Status>>),
         Pending,
+        PendingDrop(Arc<AtomicBool>),
     }
 
     #[derive(Default)]
@@ -497,7 +532,26 @@ mod tests {
                 Script::StartError(status) => Err(status),
                 Script::Stream(items) => Ok(Box::pin(tokio_stream::iter(items))),
                 Script::Pending => Ok(Box::pin(futures_util::stream::pending())),
+                Script::PendingDrop(dropped) => Ok(Box::pin(PendingDrop { dropped })),
             }
+        }
+    }
+
+    struct PendingDrop {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Stream for PendingDrop {
+        type Item = Result<ReadRowsResponse, Status>;
+
+        fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingDrop {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
         }
     }
 
@@ -710,6 +764,33 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn retry_stops_after_the_configured_attempt_count() {
+        let service = Arc::new(FakeService::new([
+            Script::StartError(Status::unavailable("first")),
+            Script::StartError(Status::unavailable("second")),
+        ]));
+        let mut limited = options();
+        limited.retry.max_attempts = 2;
+        let error = start_with_service(
+            service.clone(),
+            &config(),
+            Query::new("table").expect("valid query"),
+            limited,
+        )
+        .await
+        .expect_err("attempts exhausted");
+
+        assert!(matches!(
+            error,
+            Error::ReadRows {
+                attempts: 2,
+                source
+            } if source.code() == Code::Unavailable
+        ));
+        assert_eq!(service.requests.lock().await.len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn attempt_and_operation_deadlines_are_enforced() {
         let service = Arc::new(FakeService::new([
             Script::Pending,
@@ -763,6 +844,25 @@ mod tests {
             }
         ));
         assert_eq!(service.requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_row_stream_cancels_the_active_rpc() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let service = Arc::new(FakeService::new([Script::PendingDrop(dropped.clone())]));
+        let stream = start_with_service(
+            service,
+            &config(),
+            Query::new("table").expect("valid query"),
+            options(),
+        )
+        .await
+        .expect("read starts");
+
+        drop(stream);
+        tokio::task::yield_now().await;
+
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[test]
