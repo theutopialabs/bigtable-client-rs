@@ -301,22 +301,7 @@ impl<'a> RowDecoder<'a> {
         qualifier: impl AsRef<[u8]>,
     ) -> Result<&'a Cell, RowMappingError> {
         let qualifier = qualifier.as_ref();
-        let family_value = self.row.families.iter().find(|item| item.name == family);
-        let Some(family_value) = family_value else {
-            return Err(self.error(RowMappingIssue::MissingFamily {
-                family: family.to_owned(),
-            }));
-        };
-        let column = family_value
-            .columns
-            .iter()
-            .find(|column| column.qualifier.as_ref() == qualifier);
-        let Some(column) = column else {
-            return Err(self.error(RowMappingIssue::MissingColumn {
-                family: family.to_owned(),
-                qualifier: Bytes::copy_from_slice(qualifier),
-            }));
-        };
+        let column = self.required_column(family, qualifier)?;
         column.cells.first().ok_or_else(|| {
             self.error(RowMappingIssue::MissingCell {
                 family: family.to_owned(),
@@ -333,16 +318,7 @@ impl<'a> RowDecoder<'a> {
         qualifier: impl AsRef<[u8]>,
     ) -> Option<&'a Cell> {
         let qualifier = qualifier.as_ref();
-        self.row
-            .families
-            .iter()
-            .find(|item| item.name == family)
-            .and_then(|family| {
-                family
-                    .columns
-                    .iter()
-                    .find(|column| column.qualifier.as_ref() == qualifier)
-            })
+        self.optional_column(family, qualifier)
             .and_then(|column| column.cells.first())
     }
 
@@ -386,22 +362,7 @@ impl<'a> RowDecoder<'a> {
         qualifier: impl AsRef<[u8]>,
     ) -> Result<&'a [Cell], RowMappingError> {
         let qualifier = qualifier.as_ref();
-        let family_value = self.row.families.iter().find(|item| item.name == family);
-        let Some(family_value) = family_value else {
-            return Err(self.error(RowMappingIssue::MissingFamily {
-                family: family.to_owned(),
-            }));
-        };
-        let column = family_value
-            .columns
-            .iter()
-            .find(|column| column.qualifier.as_ref() == qualifier);
-        let Some(column) = column else {
-            return Err(self.error(RowMappingIssue::MissingColumn {
-                family: family.to_owned(),
-                qualifier: Bytes::copy_from_slice(qualifier),
-            }));
-        };
+        let column = self.required_column(family, qualifier)?;
         if column.cells.is_empty() {
             return Err(self.error(RowMappingIssue::MissingCell {
                 family: family.to_owned(),
@@ -409,6 +370,44 @@ impl<'a> RowDecoder<'a> {
             }));
         }
         Ok(&column.cells)
+    }
+
+    fn required_column(
+        &self,
+        family: &str,
+        qualifier: &[u8],
+    ) -> Result<&'a crate::Column, RowMappingError> {
+        let family_value = self.row.families.iter().find(|item| item.name == family);
+        let Some(family_value) = family_value else {
+            return Err(self.error(RowMappingIssue::MissingFamily {
+                family: family.to_owned(),
+            }));
+        };
+        Self::find_column(family_value, qualifier).ok_or_else(|| {
+            self.error(RowMappingIssue::MissingColumn {
+                family: family.to_owned(),
+                qualifier: Bytes::copy_from_slice(qualifier),
+            })
+        })
+    }
+
+    fn optional_column(&self, family: &str, qualifier: &[u8]) -> Option<&'a crate::Column> {
+        let family_value = self.row.families.iter().find(|item| item.name == family)?;
+        Self::find_column(family_value, qualifier)
+    }
+
+    fn find_column<'b>(family: &'b crate::Family, qualifier: &[u8]) -> Option<&'b crate::Column> {
+        family
+            .columns
+            .binary_search_by(|column| column.qualifier.as_ref().cmp(qualifier))
+            .ok()
+            .map(|index| &family.columns[index])
+            .or_else(|| {
+                family
+                    .columns
+                    .iter()
+                    .find(|column| column.qualifier.as_ref() == qualifier)
+            })
     }
 
     fn decode_cell<T>(
