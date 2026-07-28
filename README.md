@@ -2,10 +2,11 @@
 
 An async, production-focused Rust client for Google Cloud Bigtable.
 
-This project is under active development. M3 provides high-level reads and
+This project is under active development. M4 provides high-level reads and
 writes, typed row mapping, safe partial retries, bounded bulk requests, deadline
-policies, and direct access to the generated Tonic client. The first supported
-version will be `0.0.1` after M5.
+policies, tracing, OpenTelemetry metrics, request diagnostics, and direct access
+to the generated Tonic client. The first supported version will be `0.0.1`
+after M5.
 
 This crate is not published to crates.io.
 
@@ -24,7 +25,8 @@ This crate is not published to crates.io.
 | Bounded bulk flow control | Available | M2 |
 | Partial mutation retries | Available | M2 |
 | Typed row mapping and derive | Available | M3 |
-| Tracing and OpenTelemetry | Planned | M4 |
+| Tracing and OpenTelemetry | Available | M4 |
+| Request diagnostics | Available | M4 |
 | Production hardening and `0.0.1` | Planned | M5 |
 
 The client currently covers the Bigtable data API. Instance, cluster, and table
@@ -362,6 +364,90 @@ match client.mutate_rows(bulk).await {
 Dropping a bulk mutation future cancels active request streams and prevents new
 batches from starting.
 
+## Observability
+
+High-level reads and bulk mutations create `tracing` spans for the full
+operation and each RPC attempt:
+
+```text
+bigtable.client.operation
+└── bigtable.client.attempt
+```
+
+The spans include the RPC method, Bigtable resource IDs, attempt and batch
+counts, timeouts, final gRPC status, elapsed time, and row or mutation counts.
+Retries emit a structured warning event with the failed attempt, gRPC code,
+backoff delay, and unresolved entry count.
+
+Install a tracing subscriber in the application to collect these spans. The
+library does not install a subscriber or exporter.
+
+OpenTelemetry metrics are enabled by the default `opentelemetry` feature. The
+client gets a meter from the global provider when it connects:
+
+```rust,no_run
+use bigtable_client::{Client, ClientConfig};
+
+# async fn run() -> Result<(), bigtable_client::Error> {
+// Install your OpenTelemetry meter provider before this call.
+let client = Client::builder(ClientConfig::new("my-project", "my-instance")?)
+    .connect()
+    .await?;
+# let _ = client;
+# Ok(())
+# }
+```
+
+Use `ClientBuilder::with_meter` when the client should use a specific meter
+instead. The application owns the meter provider, readers, exporters, flushing,
+and shutdown.
+
+| Metric | Meaning |
+| --- | --- |
+| `bigtable.googleapis.com/client/operation_latencies` | Full operation time across attempts and backoff |
+| `bigtable.googleapis.com/client/attempt_latencies` | Time for one RPC attempt |
+| `bigtable.googleapis.com/client/retry_count` | Extra RPC attempts |
+| `bigtable.googleapis.com/client/first_response_latencies` | Time to the first streamed response |
+| `bigtable.googleapis.com/client/application_blocking_latencies` | Time a read waits for the application |
+
+Metric attributes use bounded resource and request fields: project, instance,
+table, app profile, method, streaming mode, gRPC status, and client version.
+
+Use a diagnostics observer when an application needs request lifecycle events
+without parsing logs:
+
+```rust,no_run
+use bigtable_client::{Client, ClientConfig, DiagnosticEvent};
+
+# async fn run() -> Result<(), bigtable_client::Error> {
+let client = Client::builder(ClientConfig::new("my-project", "my-instance")?)
+    .with_diagnostic_observer(|event: &DiagnosticEvent| {
+        println!("{event:?}");
+    })
+    .connect()
+    .await?;
+# let _ = client;
+# Ok(())
+# }
+```
+
+Observers receive operation, attempt, first-response, retry, completion, and
+cancellation events. They run inline and should return quickly.
+`with_shared_diagnostic_observer` accepts an `Arc<dyn DiagnosticObserver>` for
+reuse across clients. An observer panic is reported through `tracing` and does
+not stop the request.
+
+Spans, metrics, and diagnostics never include row keys, column qualifiers, cell
+values, idempotency tokens, or gRPC messages. Raw Tonic calls are not
+instrumented because their lifecycle belongs to the caller.
+
+Disable metrics while keeping tracing and diagnostics with:
+
+```toml
+[dependencies]
+bigtable-client = { git = "https://github.com/theutopialabs/bigtable-client-rs", default-features = false }
+```
+
 ## Raw Tonic client
 
 Use `Client::raw_client` for data API calls that do not have a high-level
@@ -503,6 +589,10 @@ binary qualifiers, JSON and custom decoders, generic structs, multiple cell
 versions, typed error locations, compiler diagnostics, typed streams, and live
 emulator reads.
 
+The M4 suite covers span hierarchy, Google-compatible metric names and
+attributes, request event order, retry summaries, deadlines, partial failures,
+cancellation, no-default-feature builds, and live emulator reads and writes.
+
 Every milestone must pass unit, public API, documentation, MSRV, release,
 package, and emulator tests before it is merged.
 
@@ -516,7 +606,7 @@ package, and emulator tests before it is merged.
   retry handling
 - M3 complete: typed row mapping, derive support, custom decoders, and typed
   streams
-- M4: tracing spans, OpenTelemetry metrics, request diagnostics
+- M4 complete: tracing spans, OpenTelemetry metrics, request diagnostics
 - M5: compatibility review, stress tests, docs, and version `0.0.1`
 
 No milestone will be published to crates.io.

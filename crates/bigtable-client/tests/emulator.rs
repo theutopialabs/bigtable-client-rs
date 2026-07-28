@@ -2,15 +2,19 @@
 
 #![cfg(feature = "emulator-tests")]
 
+#[cfg(feature = "opentelemetry")]
+use std::collections::HashSet;
 use std::{
     collections::HashMap,
     env, process,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 
 use bigtable_client::{
-    BatchPolicy, BulkMutation, BulkMutationOptions, Client, ClientConfig, Error, Mutation, Query,
-    RawClient, ReadOptions, Row, RowMappingIssue, RowMutation,
+    BatchPolicy, BigtableOperation, BulkMutation, BulkMutationOptions, Client, ClientConfig,
+    DiagnosticEvent, Error, Mutation, Query, RawClient, ReadOptions, Row, RowMappingIssue,
+    RowMutation,
     proto::{
         MutateRowRequest, Mutation as ProtoMutation, ReadRowsRequest, RowSet,
         mutation::{Mutation as MutationKind, SetCell},
@@ -20,6 +24,13 @@ use bigtable_client::{
 use googleapis_tonic_google_bigtable_admin_v2::google::bigtable::admin::v2::{
     ColumnFamily, CreateTableRequest, DeleteTableRequest, Table,
     bigtable_table_admin_client::BigtableTableAdminClient,
+};
+#[cfg(feature = "opentelemetry")]
+use opentelemetry::metrics::MeterProvider as _;
+#[cfg(feature = "opentelemetry")]
+use opentelemetry_sdk::metrics::{
+    InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+    data::{ResourceMetrics, ScopeMetrics},
 };
 use serde::Deserialize;
 use tonic::{Request, metadata::MetadataValue, transport::Endpoint};
@@ -46,6 +57,127 @@ struct TypedUser {
     preferences: Preferences,
 }
 
+struct Observability {
+    diagnostics: Arc<Mutex<Vec<DiagnosticEvent>>>,
+    #[cfg(feature = "opentelemetry")]
+    exporter: InMemoryMetricExporter,
+    #[cfg(feature = "opentelemetry")]
+    provider: SdkMeterProvider,
+}
+
+impl Observability {
+    fn assert_finished(self) {
+        let diagnostics = self.diagnostics.lock().expect("diagnostics lock");
+        let operation_starts = diagnostics
+            .iter()
+            .filter(|event| matches!(event, DiagnosticEvent::OperationStarted { .. }))
+            .count();
+        let operation_finishes = diagnostics
+            .iter()
+            .filter(|event| matches!(event, DiagnosticEvent::OperationFinished { .. }))
+            .count();
+        let attempt_starts = diagnostics
+            .iter()
+            .filter(|event| matches!(event, DiagnosticEvent::AttemptStarted { .. }))
+            .count();
+        let attempt_finishes = diagnostics
+            .iter()
+            .filter(|event| matches!(event, DiagnosticEvent::AttemptFinished { .. }))
+            .count();
+        assert!(operation_starts >= 10);
+        assert_eq!(operation_starts, operation_finishes);
+        assert_eq!(attempt_starts, attempt_finishes);
+        assert!(diagnostics.iter().any(|event| matches!(
+            event,
+            DiagnosticEvent::OperationStarted {
+                operation: BigtableOperation::ReadRows,
+                ..
+            }
+        )));
+        assert!(diagnostics.iter().any(|event| matches!(
+            event,
+            DiagnosticEvent::OperationStarted {
+                operation: BigtableOperation::MutateRows,
+                ..
+            }
+        )));
+        assert!(diagnostics.iter().all(|event| !matches!(
+            event,
+            DiagnosticEvent::OperationFinished { code, .. } if *code != tonic::Code::Ok
+        )));
+        drop(diagnostics);
+
+        #[cfg(feature = "opentelemetry")]
+        self.assert_metrics();
+    }
+
+    #[cfg(feature = "opentelemetry")]
+    fn assert_metrics(self) {
+        self.provider.force_flush().expect("flush emulator metrics");
+        let metric_names = self
+            .exporter
+            .get_finished_metrics()
+            .expect("finished emulator metrics")
+            .iter()
+            .flat_map(ResourceMetrics::scope_metrics)
+            .flat_map(ScopeMetrics::metrics)
+            .map(|metric| metric.name().to_owned())
+            .collect::<HashSet<_>>();
+        assert!(metric_names.contains("bigtable.googleapis.com/client/operation_latencies"));
+        assert!(metric_names.contains("bigtable.googleapis.com/client/attempt_latencies"));
+        assert!(metric_names.contains("bigtable.googleapis.com/client/first_response_latencies"));
+        assert!(
+            metric_names.contains("bigtable.googleapis.com/client/application_blocking_latencies")
+        );
+        self.provider
+            .shutdown()
+            .expect("shut down emulator metrics");
+    }
+}
+
+async fn connect_client(endpoint: String) -> (Client, Observability) {
+    let diagnostics = Arc::new(Mutex::new(Vec::new()));
+    let observer_diagnostics = Arc::clone(&diagnostics);
+    #[cfg(feature = "opentelemetry")]
+    let exporter = InMemoryMetricExporter::default();
+    #[cfg(feature = "opentelemetry")]
+    let provider = SdkMeterProvider::builder()
+        .with_reader(PeriodicReader::builder(exporter.clone()).build())
+        .build();
+    let config = ClientConfig::new(PROJECT_ID, INSTANCE_ID)
+        .expect("valid config")
+        .with_emulator_host(endpoint)
+        .expect("valid emulator")
+        .with_channel_pool_size(2)
+        .expect("valid channel pool");
+    let builder =
+        Client::builder(config).with_diagnostic_observer(move |event: &DiagnosticEvent| {
+            observer_diagnostics
+                .lock()
+                .expect("diagnostics lock")
+                .push(event.clone());
+        });
+    #[cfg(feature = "opentelemetry")]
+    let builder = builder.with_meter(provider.meter("emulator-test"));
+    let client = builder
+        .connect()
+        .await
+        .expect("client connects without credentials");
+    assert!(client.config().uses_emulator());
+    assert_eq!(client.config().channel_pool_size(), 2);
+
+    (
+        client,
+        Observability {
+            diagnostics,
+            #[cfg(feature = "opentelemetry")]
+            exporter,
+            #[cfg(feature = "opentelemetry")]
+            provider,
+        },
+    )
+}
+
 #[tokio::test]
 async fn raw_and_high_level_clients_cover_reads_and_bulk_mutations() {
     if env::var_os("RUN_BIGTABLE_EMULATOR_TESTS").is_none() {
@@ -64,7 +196,7 @@ async fn raw_and_high_level_clients_cover_reads_and_bulk_mutations() {
     let mut admin = connect_admin(&endpoint).await;
     create_table(&mut admin, parent, &table_id).await;
 
-    let client = connect_client(endpoint).await;
+    let (client, observability) = connect_client(endpoint).await;
 
     let mut raw = client.raw_client();
     write_raw_row(&mut raw, &table_name, b"row-raw", b"raw value").await;
@@ -148,21 +280,8 @@ async fn raw_and_high_level_clients_cover_reads_and_bulk_mutations() {
             b"row-range".to_vec(),
         ]
     );
-}
 
-async fn connect_client(endpoint: String) -> Client {
-    let config = ClientConfig::new(PROJECT_ID, INSTANCE_ID)
-        .expect("valid config")
-        .with_emulator_host(endpoint)
-        .expect("valid emulator")
-        .with_channel_pool_size(2)
-        .expect("valid channel pool");
-    let client = Client::connect(config)
-        .await
-        .expect("client connects without credentials");
-    assert!(client.config().uses_emulator());
-    assert_eq!(client.config().channel_pool_size(), 2);
-    client
+    observability.assert_finished();
 }
 
 async fn write_typed_fixture(client: &Client, table_id: &str) {

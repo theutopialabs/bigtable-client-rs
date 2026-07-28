@@ -1,12 +1,13 @@
 //! Public API contract tests.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use bigtable_client::{
-    BatchPolicy, BulkMutation, BulkMutationOptions, BulkMutationPolicyIssue, Cell, ClientConfig,
-    Column, ConfigField, ConfigIssue, DeadlinePolicy, Error, Family, FromRow, Jitter, Mutation,
-    MutationIssue, Query, QueryIssue, ReadOptions, RetryPolicy, Row, RowBound, RowDecoder,
-    RowMappingIssue, RowMutation, RowRange, RowStream, TypedRowStream, proto,
+    BatchPolicy, BigtableOperation, BulkMutation, BulkMutationOptions, BulkMutationPolicyIssue,
+    Cell, Client, ClientConfig, Column, ConfigField, ConfigIssue, DeadlinePolicy, DiagnosticEvent,
+    DiagnosticObserver, Error, Family, FromRow, Jitter, Mutation, MutationIssue, Query, QueryIssue,
+    ReadOptions, RetryPolicy, Row, RowBound, RowDecoder, RowMappingIssue, RowMutation, RowRange,
+    RowStream, TypedRowStream, proto,
 };
 use bytes::Bytes;
 use futures_core::Stream;
@@ -149,6 +150,35 @@ fn public_read_policies_are_configurable() {
 
     assert_eq!(options.retry.max_attempts, 5);
     assert_eq!(options.deadlines.attempt_timeout, Duration::from_secs(5));
+}
+
+#[test]
+fn public_observability_api_builds_without_connecting() {
+    let config = ClientConfig::new("project", "instance").expect("valid config");
+    let builder =
+        Client::builder(config.clone()).with_diagnostic_observer(|_event: &DiagnosticEvent| {});
+    assert!(format!("{builder:?}").contains("has_diagnostic_observer: true"));
+
+    let observer: Arc<dyn DiagnosticObserver> = Arc::new(|_event: &DiagnosticEvent| {});
+    let shared = Client::builder(config).with_shared_diagnostic_observer(observer);
+    assert!(format!("{shared:?}").contains("has_diagnostic_observer: true"));
+
+    let operation = BigtableOperation::ReadRows;
+    assert!(matches!(operation, BigtableOperation::ReadRows));
+}
+
+#[cfg(feature = "opentelemetry")]
+#[test]
+fn public_builder_accepts_a_custom_meter() {
+    use opentelemetry::metrics::MeterProvider as _;
+    use opentelemetry_sdk::metrics::SdkMeterProvider;
+
+    let provider = SdkMeterProvider::default();
+    let meter = provider.meter("public-api-test");
+    let builder = Client::builder(ClientConfig::new("project", "instance").expect("valid config"))
+        .with_meter(meter);
+
+    assert!(format!("{builder:?}").contains("has_custom_meter: true"));
 }
 
 #[test]

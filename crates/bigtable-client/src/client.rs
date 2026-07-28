@@ -11,12 +11,14 @@ use tonic::{
 };
 
 use crate::{
-    BulkMutation, BulkMutationOptions, BulkMutationResult, ClientConfig, Error, FromRow, Query,
-    ReadOptions, Row, RowMutation, RowStream, TypedRowStream,
+    BulkMutation, BulkMutationOptions, BulkMutationResult, ClientConfig, DiagnosticObserver, Error,
+    FromRow, Query, ReadOptions, Row, RowMutation, RowStream, TypedRowStream,
     auth::{GcpTokenSource, TokenManager},
     channel,
     proto::{FeatureFlags, bigtable_client::BigtableClient},
-    read, write,
+    read,
+    telemetry::Telemetry,
+    write,
 };
 
 const API_CLIENT_HEADER: &str = concat!(
@@ -35,7 +37,99 @@ pub struct Client {
     inner: Arc<ClientInner>,
 }
 
+/// Builds a client with optional credentials and observability hooks.
+pub struct ClientBuilder {
+    config: ClientConfig,
+    provider: Option<Arc<dyn TokenProvider>>,
+    observer: Option<Arc<dyn DiagnosticObserver>>,
+    #[cfg(feature = "opentelemetry")]
+    meter: Option<opentelemetry::metrics::Meter>,
+}
+
+impl ClientBuilder {
+    fn new(config: ClientConfig) -> Self {
+        Self {
+            config,
+            provider: None,
+            observer: None,
+            #[cfg(feature = "opentelemetry")]
+            meter: None,
+        }
+    }
+
+    /// Uses a caller-provided Google Cloud token provider.
+    ///
+    /// Emulator connections ignore the provider.
+    #[must_use]
+    pub fn with_token_provider(mut self, provider: Arc<dyn TokenProvider>) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
+    /// Sends structured request lifecycle events to an observer.
+    ///
+    /// The observer runs inline and should return quickly.
+    #[must_use]
+    pub fn with_diagnostic_observer(mut self, observer: impl DiagnosticObserver) -> Self {
+        self.observer = Some(Arc::new(observer));
+        self
+    }
+
+    /// Sends lifecycle events to a shared diagnostics observer.
+    ///
+    /// This is useful when several clients share one observer.
+    #[must_use]
+    pub fn with_shared_diagnostic_observer(
+        mut self,
+        observer: Arc<dyn DiagnosticObserver>,
+    ) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Records client metrics through a caller-provided OpenTelemetry meter.
+    ///
+    /// Without this override, the client gets a meter from the global provider
+    /// when it connects.
+    #[cfg(feature = "opentelemetry")]
+    #[must_use]
+    pub fn with_meter(mut self, meter: opentelemetry::metrics::Meter) -> Self {
+        self.meter = Some(meter);
+        self
+    }
+
+    /// Connects the configured client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Authentication`] when credentials cannot be found or a
+    /// token cannot be fetched. Returns [`Error::Transport`] when the gRPC
+    /// channel cannot connect.
+    pub async fn connect(self) -> Result<Client, Error> {
+        Client::connect_builder(self).await
+    }
+}
+
+impl fmt::Debug for ClientBuilder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut builder = formatter.debug_struct("ClientBuilder");
+        builder
+            .field("config", &self.config)
+            .field("has_token_provider", &self.provider.is_some())
+            .field("has_diagnostic_observer", &self.observer.is_some());
+        #[cfg(feature = "opentelemetry")]
+        builder.field("has_custom_meter", &self.meter.is_some());
+        builder.finish_non_exhaustive()
+    }
+}
+
 impl Client {
+    /// Starts a client builder for custom credentials and observability.
+    #[must_use]
+    pub fn builder(config: ClientConfig) -> ClientBuilder {
+        ClientBuilder::new(config)
+    }
+
     /// Connects with Google application default credentials.
     ///
     /// Emulator connections skip authentication.
@@ -46,16 +140,7 @@ impl Client {
     /// token cannot be fetched. Returns [`Error::Transport`] when the gRPC
     /// channel cannot connect.
     pub async fn connect(config: ClientConfig) -> Result<Self, Error> {
-        if config.uses_emulator() {
-            return Self::connect_inner(config, None).await;
-        }
-
-        let provider = gcp_auth::provider()
-            .await
-            .map_err(|source| Error::Authentication {
-                source: Box::new(source),
-            })?;
-        Self::connect_with_token_provider(config, provider).await
+        Self::builder(config).connect().await
     }
 
     /// Connects with a caller-provided Google Cloud token provider.
@@ -70,12 +155,10 @@ impl Client {
         config: ClientConfig,
         provider: Arc<dyn TokenProvider>,
     ) -> Result<Self, Error> {
-        if config.uses_emulator() {
-            return Self::connect_inner(config, None).await;
-        }
-
-        let tokens = TokenManager::start(Arc::new(GcpTokenSource::new(provider))).await?;
-        Self::connect_inner(config, Some(tokens)).await
+        Self::builder(config)
+            .with_token_provider(provider)
+            .connect()
+            .await
     }
 
     /// Returns the configuration used by this client.
@@ -106,7 +189,14 @@ impl Client {
     pub async fn read_rows(&self, query: Query) -> Result<RowStream, Error> {
         let mut options = ReadOptions::default();
         options.deadlines.operation_timeout = self.config().request_timeout();
-        read::start(self.raw_client(), self.config(), query, options).await
+        read::start(
+            self.raw_client(),
+            self.config(),
+            self.inner.telemetry.clone(),
+            query,
+            options,
+        )
+        .await
     }
 
     /// Starts a row query with caller-provided retry and deadline settings.
@@ -121,7 +211,14 @@ impl Client {
         query: Query,
         options: ReadOptions,
     ) -> Result<RowStream, Error> {
-        read::start(self.raw_client(), self.config(), query, options).await
+        read::start(
+            self.raw_client(),
+            self.config(),
+            self.inner.telemetry.clone(),
+            query,
+            options,
+        )
+        .await
     }
 
     /// Reads one row by exact key.
@@ -247,7 +344,14 @@ impl Client {
     pub async fn mutate_rows(&self, mutation: BulkMutation) -> Result<BulkMutationResult, Error> {
         let mut options = BulkMutationOptions::default();
         options.deadlines.operation_timeout = self.config().request_timeout();
-        write::execute(self.raw_client(), self.config(), mutation, options).await
+        write::execute(
+            self.raw_client(),
+            self.config(),
+            self.inner.telemetry.clone(),
+            mutation,
+            options,
+        )
+        .await
     }
 
     /// Applies row mutations with caller-provided policies.
@@ -262,7 +366,14 @@ impl Client {
         mutation: BulkMutation,
         options: BulkMutationOptions,
     ) -> Result<BulkMutationResult, Error> {
-        write::execute(self.raw_client(), self.config(), mutation, options).await
+        write::execute(
+            self.raw_client(),
+            self.config(),
+            self.inner.telemetry.clone(),
+            mutation,
+            options,
+        )
+        .await
     }
 
     /// Applies one atomic row mutation.
@@ -296,16 +407,42 @@ impl Client {
         Ok(())
     }
 
-    async fn connect_inner(
-        config: ClientConfig,
-        tokens: Option<Arc<TokenManager>>,
-    ) -> Result<Self, Error> {
+    async fn connect_builder(builder: ClientBuilder) -> Result<Self, Error> {
+        let ClientBuilder {
+            config,
+            provider,
+            observer,
+            #[cfg(feature = "opentelemetry")]
+            meter,
+        } = builder;
+        #[cfg(feature = "opentelemetry")]
+        let telemetry = Telemetry::new(observer, meter);
+        #[cfg(not(feature = "opentelemetry"))]
+        let telemetry = Telemetry::new(observer);
+
+        let tokens = if config.uses_emulator() {
+            None
+        } else {
+            let provider = match provider {
+                Some(provider) => provider,
+                None => gcp_auth::provider()
+                    .await
+                    .map_err(|source| Error::Authentication {
+                        source: Box::new(source),
+                    })?,
+            };
+            Some(TokenManager::start(Arc::new(GcpTokenSource::new(provider))).await?)
+        };
         let channel = channel::connect(&config).await?;
         let interceptor = AuthInterceptor::new(tokens)?;
         let raw = BigtableClient::with_interceptor(channel, interceptor);
 
         Ok(Self {
-            inner: Arc::new(ClientInner { config, raw }),
+            inner: Arc::new(ClientInner {
+                config,
+                raw,
+                telemetry,
+            }),
         })
     }
 }
@@ -322,6 +459,7 @@ impl fmt::Debug for Client {
 struct ClientInner {
     config: ClientConfig,
     raw: RawClient,
+    telemetry: Telemetry,
 }
 
 /// Adds authentication and standard Bigtable metadata to raw Tonic requests.
