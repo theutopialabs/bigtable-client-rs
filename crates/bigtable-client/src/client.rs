@@ -12,7 +12,7 @@ use tonic::{
 
 use crate::{
     BulkMutation, BulkMutationOptions, BulkMutationResult, ClientConfig, Error, Query, ReadOptions,
-    Row, RowStream,
+    Row, RowMutation, RowStream,
     auth::{GcpTokenSource, TokenManager},
     channel,
     proto::{FeatureFlags, bigtable_client::BigtableClient},
@@ -171,6 +171,37 @@ impl Client {
         options: BulkMutationOptions,
     ) -> Result<BulkMutationResult, Error> {
         write::execute(self.raw_client(), self.config(), mutation, options).await
+    }
+
+    /// Applies one atomic row mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns mutation, policy, metadata, deadline, or gRPC errors.
+    pub async fn mutate_row(
+        &self,
+        table_id: impl Into<String>,
+        mutation: RowMutation,
+    ) -> Result<(), Error> {
+        let bulk = BulkMutation::new(table_id)?.entry(mutation)?;
+        self.mutate_rows(bulk).await?;
+        Ok(())
+    }
+
+    /// Applies one atomic row mutation with caller-provided policies.
+    ///
+    /// # Errors
+    ///
+    /// Returns mutation, policy, metadata, deadline, or gRPC errors.
+    pub async fn mutate_row_with_options(
+        &self,
+        table_id: impl Into<String>,
+        mutation: RowMutation,
+        options: BulkMutationOptions,
+    ) -> Result<(), Error> {
+        let bulk = BulkMutation::new(table_id)?.entry(mutation)?;
+        self.mutate_rows_with_options(bulk, options).await?;
+        Ok(())
     }
 
     async fn connect_inner(

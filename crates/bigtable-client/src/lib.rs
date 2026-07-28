@@ -1,8 +1,8 @@
 //! An async Rust client for Google Cloud Bigtable.
 //!
-//! The high-level API provides row queries, streamed row assembly, retry
-//! resumption, and separate attempt and operation deadlines. The generated
-//! Tonic client remains available for direct data API calls.
+//! The high-level API provides row queries, streamed row assembly, atomic row
+//! mutations, bulk writes, partial retries, and operation deadlines. The
+//! generated Tonic client remains available for direct data API calls.
 //!
 //! # Quick start
 //!
