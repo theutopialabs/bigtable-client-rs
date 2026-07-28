@@ -22,6 +22,44 @@ pub enum Error {
         #[source]
         source: Box<figment::Error>,
     },
+
+    /// Application default credentials could not provide an access token.
+    #[error("failed to authenticate with Google Cloud: {source}")]
+    Authentication {
+        /// The authentication source error.
+        #[source]
+        source: Box<gcp_auth::Error>,
+    },
+
+    /// A Google Cloud access token could not be used as gRPC metadata.
+    #[error("Google Cloud returned an invalid access token: {source}")]
+    InvalidAccessToken {
+        /// The metadata parsing error.
+        #[source]
+        source: tonic::metadata::errors::InvalidMetadataValue,
+    },
+
+    /// Static client metadata could not be encoded for a gRPC request.
+    #[error("failed to encode the {header} metadata header: {source}")]
+    InvalidClientMetadata {
+        /// The header that failed.
+        header: &'static str,
+        /// The metadata parsing error.
+        #[source]
+        source: tonic::metadata::errors::InvalidMetadataValue,
+    },
+
+    /// The gRPC channel could not be built or connected.
+    #[error("failed to connect to Bigtable: {source}")]
+    Transport {
+        /// The transport source error.
+        #[source]
+        source: Box<tonic::transport::Error>,
+    },
+
+    /// The internal channel pool stopped while it was being initialized.
+    #[error("failed to initialize the Bigtable channel pool")]
+    ChannelPoolClosed,
 }
 
 impl Error {
@@ -122,6 +160,57 @@ mod tests {
         assert_eq!(
             error.to_string(),
             format!("failed to load Bigtable configuration: {source_message}")
+        );
+    }
+
+    #[test]
+    fn invalid_access_token_display_includes_source() {
+        let source = "bad\nvalue"
+            .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
+            .expect_err("newlines are not valid metadata");
+        let source_message = source.to_string();
+        let error = Error::InvalidAccessToken { source };
+
+        assert_eq!(
+            error.to_string(),
+            format!("Google Cloud returned an invalid access token: {source_message}")
+        );
+    }
+
+    #[test]
+    fn invalid_client_metadata_display_names_header_and_source() {
+        let source = "bad\nvalue"
+            .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
+            .expect_err("newlines are not valid metadata");
+        let source_message = source.to_string();
+        let error = Error::InvalidClientMetadata {
+            header: "test-header",
+            source,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            format!("failed to encode the test-header metadata header: {source_message}")
+        );
+    }
+
+    #[test]
+    fn authentication_display_includes_source() {
+        let error = Error::Authentication {
+            source: Box::new(gcp_auth::Error::Str("test auth failure")),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "failed to authenticate with Google Cloud: test auth failure"
+        );
+    }
+
+    #[test]
+    fn channel_pool_error_has_recovery_context() {
+        assert_eq!(
+            Error::ChannelPoolClosed.to_string(),
+            "failed to initialize the Bigtable channel pool"
         );
     }
 
