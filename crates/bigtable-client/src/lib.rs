@@ -23,11 +23,14 @@
 //! # }
 //! ```
 
+extern crate self as bigtable_client;
+
 mod auth;
 mod channel;
 mod client;
 mod config;
 mod error;
+mod mapping;
 mod merge;
 mod mutation;
 mod query;
@@ -37,13 +40,16 @@ mod retry;
 mod row;
 mod write;
 
+pub use bigtable_client_derive::FromRow;
 pub use client::{AuthInterceptor, Client, RawClient};
 pub use config::ClientConfig;
 pub use error::{
     BulkMutationError, BulkMutationPolicyIssue, ConfigField, ConfigIssue, Error,
     MutateRowsResponseIssue, MutationFailure, MutationFailureCause, MutationIssue, QueryIssue,
-    ReadPolicyIssue, RowMergeIssue,
+    ReadPolicyIssue, RowMappingError, RowMappingIssue, RowMergeIssue, RowValueLocation,
+    ValueDecodeError,
 };
+pub use mapping::{DecodedCell, FromCellValue, FromJsonValue, FromRow, RowDecoder, TypedRowStream};
 pub use mutation::{BulkMutation, Mutation, RowMutation};
 pub use query::{Query, RowBound, RowRange};
 pub use read::RowStream;

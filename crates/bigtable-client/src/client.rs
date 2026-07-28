@@ -11,8 +11,8 @@ use tonic::{
 };
 
 use crate::{
-    BulkMutation, BulkMutationOptions, BulkMutationResult, ClientConfig, Error, Query, ReadOptions,
-    Row, RowMutation, RowStream,
+    BulkMutation, BulkMutationOptions, BulkMutationResult, ClientConfig, Error, FromRow, Query,
+    ReadOptions, Row, RowMutation, RowStream, TypedRowStream,
     auth::{GcpTokenSource, TokenManager},
     channel,
     proto::{FeatureFlags, bigtable_client::BigtableClient},
@@ -140,6 +140,98 @@ impl Client {
             Some(row) => row.map(Some),
             None => Ok(None),
         }
+    }
+
+    /// Reads one row by exact key with caller-provided policies.
+    ///
+    /// # Errors
+    ///
+    /// Returns query, policy, gRPC, deadline, or row assembly errors.
+    pub async fn read_row_with_options(
+        &self,
+        table_id: impl Into<String>,
+        row_key: impl Into<bytes::Bytes>,
+        options: ReadOptions,
+    ) -> Result<Option<Row>, Error> {
+        let query = Query::new(table_id)?.row_key(row_key).limit(1)?;
+        let mut rows = self.read_rows_with_options(query, options).await?;
+        match rows.next().await {
+            Some(row) => row.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Starts a row query mapped to an owned Rust type.
+    ///
+    /// # Errors
+    ///
+    /// Returns query, policy, routing, or initial gRPC errors before the stream
+    /// starts. Later read and mapping errors are returned as stream items.
+    pub async fn read_rows_as<T>(&self, query: Query) -> Result<TypedRowStream<T>, Error>
+    where
+        T: FromRow,
+    {
+        self.read_rows(query).await.map(TypedRowStream::new)
+    }
+
+    /// Starts a typed row query with caller-provided read policies.
+    ///
+    /// # Errors
+    ///
+    /// Returns query, policy, routing, or initial gRPC errors before the stream
+    /// starts. Later read and mapping errors are returned as stream items.
+    pub async fn read_rows_as_with_options<T>(
+        &self,
+        query: Query,
+        options: ReadOptions,
+    ) -> Result<TypedRowStream<T>, Error>
+    where
+        T: FromRow,
+    {
+        self.read_rows_with_options(query, options)
+            .await
+            .map(TypedRowStream::new)
+    }
+
+    /// Reads one row and maps it to an owned Rust type.
+    ///
+    /// # Errors
+    ///
+    /// Returns query, policy, gRPC, row assembly, or mapping errors.
+    pub async fn read_row_as<T>(
+        &self,
+        table_id: impl Into<String>,
+        row_key: impl Into<bytes::Bytes>,
+    ) -> Result<Option<T>, Error>
+    where
+        T: FromRow,
+    {
+        self.read_row(table_id, row_key)
+            .await?
+            .map(T::from_row)
+            .transpose()
+            .map_err(Error::from)
+    }
+
+    /// Reads and maps one row with caller-provided read policies.
+    ///
+    /// # Errors
+    ///
+    /// Returns query, policy, gRPC, row assembly, or mapping errors.
+    pub async fn read_row_as_with_options<T>(
+        &self,
+        table_id: impl Into<String>,
+        row_key: impl Into<bytes::Bytes>,
+        options: ReadOptions,
+    ) -> Result<Option<T>, Error>
+    where
+        T: FromRow,
+    {
+        self.read_row_with_options(table_id, row_key, options)
+            .await?
+            .map(T::from_row)
+            .transpose()
+            .map_err(Error::from)
     }
 
     /// Applies row mutations in bounded concurrent batches.
