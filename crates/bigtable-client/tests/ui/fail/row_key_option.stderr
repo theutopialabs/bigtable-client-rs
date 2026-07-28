@@ -1,0 +1,5 @@
+error: a row key field cannot be Option
+ --> tests/ui/fail/row_key_option.rs:5:5
+  |
+5 |     #[bigtable(row_key)]
+  |     ^

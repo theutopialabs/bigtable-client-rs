@@ -18,6 +18,7 @@ emulator-tests = []
 arc-swap.workspace = true
 async-trait.workspace = true
 base64.workspace = true
+bigtable-client-derive = { version = "=0.0.0", path = "../bigtable-client-derive" }
 bytes.workspace = true
 fastrand.workspace = true
 figment.workspace = true
@@ -31,6 +32,7 @@ humantime-serde.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -41,6 +43,7 @@ tracing.workspace = true
 figment = { workspace = true, features = ["test"] }
 googleapis-tonic-google-bigtable-admin-v2.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+trybuild.workspace = true
 
 [lints]
 workspace = true

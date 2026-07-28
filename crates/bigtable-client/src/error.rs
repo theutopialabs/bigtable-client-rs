@@ -1,5 +1,6 @@
 use std::fmt;
 
+use bytes::Bytes;
 use thiserror::Error;
 
 /// A client operation error.
@@ -68,6 +69,12 @@ pub enum Error {
         issue: QueryIssue,
     },
 
+    /// A complete Bigtable row could not be mapped to the requested Rust type.
+    ///
+    /// Inspect the source for the missing schema location or invalid value.
+    #[error(transparent)]
+    RowMapping(#[from] RowMappingError),
+
     /// A high-level mutation contains a value Bigtable cannot accept.
     ///
     /// Check `issue`, fix the input, and rebuild the mutation before retrying.
@@ -124,6 +131,138 @@ pub enum Error {
         /// The configured operation timeout.
         timeout: std::time::Duration,
     },
+}
+
+/// A complete row that could not be mapped to a Rust type.
+#[derive(Debug, Error)]
+#[error("failed to map Bigtable row (row_key_bytes={row_key_bytes}): {issue}")]
+pub struct RowMappingError {
+    row_key: Bytes,
+    row_key_bytes: usize,
+    #[source]
+    issue: Box<RowMappingIssue>,
+}
+
+impl RowMappingError {
+    pub(crate) fn new(row_key: Bytes, issue: RowMappingIssue) -> Self {
+        let row_key_bytes = row_key.len();
+        Self {
+            row_key,
+            row_key_bytes,
+            issue: Box::new(issue),
+        }
+    }
+
+    /// Returns the raw key for the row that failed to map.
+    #[must_use]
+    pub const fn row_key(&self) -> &Bytes {
+        &self.row_key
+    }
+
+    /// Returns the schema or value problem.
+    #[must_use]
+    pub fn issue(&self) -> &RowMappingIssue {
+        self.issue.as_ref()
+    }
+}
+
+/// The schema or value problem found while mapping a row.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum RowMappingIssue {
+    /// A required column family is absent from this sparse row.
+    #[error("required column family '{family}' is missing")]
+    MissingFamily {
+        /// Required family name.
+        family: String,
+    },
+    /// A required qualifier is absent from its column family.
+    #[error("required qualifier {qualifier:?} is missing from column family '{family}'")]
+    MissingColumn {
+        /// Required family name.
+        family: String,
+        /// Required raw qualifier.
+        qualifier: Bytes,
+    },
+    /// A selected column contains no cell versions.
+    #[error("qualifier {qualifier:?} in column family '{family}' has no cells")]
+    MissingCell {
+        /// Selected family name.
+        family: String,
+        /// Selected raw qualifier.
+        qualifier: Bytes,
+    },
+    /// A row key or cell value could not be decoded as its Rust target type.
+    #[error("invalid value at {location}: {source}")]
+    InvalidValue {
+        /// Source byte location.
+        location: RowValueLocation,
+        /// Value decoder failure.
+        #[source]
+        source: ValueDecodeError,
+    },
+}
+
+/// The row location of a value decoder failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RowValueLocation {
+    /// The row key.
+    RowKey,
+    /// One timestamped cell version.
+    Cell {
+        /// Column family name.
+        family: String,
+        /// Raw column qualifier.
+        qualifier: Bytes,
+        /// Cell timestamp in microseconds.
+        timestamp_micros: i64,
+    },
+}
+
+impl fmt::Display for RowValueLocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RowKey => formatter.write_str("row key"),
+            Self::Cell {
+                family,
+                qualifier,
+                timestamp_micros,
+            } => write!(
+                formatter,
+                "column family '{family}', qualifier {qualifier:?}, timestamp {timestamp_micros}"
+            ),
+        }
+    }
+}
+
+/// A byte value that could not be decoded as its target Rust type.
+#[derive(Debug, Error)]
+#[error("cannot decode value as {target}: {source}")]
+pub struct ValueDecodeError {
+    target: &'static str,
+    #[source]
+    source: Box<dyn std::error::Error + Send + Sync + 'static>,
+}
+
+impl ValueDecodeError {
+    /// Wraps a decoder error and records its target Rust type.
+    #[must_use]
+    pub fn new<T, E>(source: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self {
+            target: std::any::type_name::<T>(),
+            source: Box::new(source),
+        }
+    }
+
+    /// Returns the target Rust type name.
+    #[must_use]
+    pub const fn target(&self) -> &'static str {
+        self.target
+    }
 }
 
 /// The reason a streamed row could not be assembled.

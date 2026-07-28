@@ -1,0 +1,5 @@
+error: unsupported field-level bigtable attribute
+ --> tests/ui/fail/unsupported_attribute.rs:6:16
+  |
+6 |     #[bigtable(flatten)]
+  |                ^^^^^^^

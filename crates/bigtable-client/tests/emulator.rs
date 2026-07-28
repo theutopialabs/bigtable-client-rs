@@ -9,8 +9,8 @@ use std::{
 };
 
 use bigtable_client::{
-    BatchPolicy, BulkMutation, BulkMutationOptions, Client, ClientConfig, Mutation, Query,
-    RawClient, Row, RowMutation,
+    BatchPolicy, BulkMutation, BulkMutationOptions, Client, ClientConfig, Error, Mutation, Query,
+    RawClient, ReadOptions, Row, RowMappingIssue, RowMutation,
     proto::{
         MutateRowRequest, Mutation as ProtoMutation, ReadRowsRequest, RowSet,
         mutation::{Mutation as MutationKind, SetCell},
@@ -21,12 +21,30 @@ use googleapis_tonic_google_bigtable_admin_v2::google::bigtable::admin::v2::{
     ColumnFamily, CreateTableRequest, DeleteTableRequest, Table,
     bigtable_table_admin_client::BigtableTableAdminClient,
 };
+use serde::Deserialize;
 use tonic::{Request, metadata::MetadataValue, transport::Endpoint};
 
 const PROJECT_ID: &str = "test-project";
 const INSTANCE_ID: &str = "test-instance";
 const FAMILY: &str = "family";
 const QUALIFIER: &[u8] = b"qualifier";
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+struct Preferences {
+    theme: String,
+}
+
+#[derive(Debug, Eq, PartialEq, bigtable_client::FromRow)]
+#[bigtable(family = "family")]
+struct TypedUser {
+    #[bigtable(row_key)]
+    key: String,
+    name: String,
+    age: u32,
+    nickname: Option<String>,
+    #[bigtable(json)]
+    preferences: Preferences,
+}
 
 #[tokio::test]
 async fn raw_and_high_level_clients_cover_reads_and_bulk_mutations() {
@@ -46,17 +64,7 @@ async fn raw_and_high_level_clients_cover_reads_and_bulk_mutations() {
     let mut admin = connect_admin(&endpoint).await;
     create_table(&mut admin, parent, &table_id).await;
 
-    let config = ClientConfig::new(PROJECT_ID, INSTANCE_ID)
-        .expect("valid config")
-        .with_emulator_host(endpoint)
-        .expect("valid emulator")
-        .with_channel_pool_size(2)
-        .expect("valid channel pool");
-    let client = Client::connect(config)
-        .await
-        .expect("client connects without credentials");
-    assert!(client.config().uses_emulator());
-    assert_eq!(client.config().channel_pool_size(), 2);
+    let client = connect_client(endpoint).await;
 
     let mut raw = client.raw_client();
     write_raw_row(&mut raw, &table_name, b"row-raw", b"raw value").await;
@@ -69,6 +77,7 @@ async fn raw_and_high_level_clients_cover_reads_and_bulk_mutations() {
         )
         .await
         .expect("single-row mutation succeeds");
+    write_typed_fixture(&client, &table_id).await;
 
     let raw_chunks = raw_read(&mut raw, &table_name, b"row-raw").await;
     let row_one = read_required(&client, &table_id, b"row-1").await;
@@ -78,6 +87,16 @@ async fn raw_and_high_level_clients_cover_reads_and_bulk_mutations() {
         .read_row(&table_id, b"row-delete".to_vec())
         .await
         .expect("deleted row read succeeds");
+    let typed_point = client
+        .read_row_as::<TypedUser>(&table_id, b"typed-z".to_vec())
+        .await
+        .expect("typed point read succeeds")
+        .expect("typed row exists");
+    let typed_missing = client
+        .read_row_as::<TypedUser>(&table_id, b"typed-missing".to_vec())
+        .await
+        .expect("missing typed point read succeeds");
+    let typed_results = read_typed_fixture(&client, &table_id).await;
 
     delete_bulk_fixture(&client, &table_id).await;
     let row_one_after_delete = client
@@ -108,6 +127,20 @@ async fn raw_and_high_level_clients_cover_reads_and_bulk_mutations() {
     assert!(row_one_after_delete.is_none());
     assert!(row_two_after_delete.is_none());
     assert_eq!(
+        typed_point,
+        TypedUser {
+            key: "typed-z".to_owned(),
+            name: "Zoe".to_owned(),
+            age: 42,
+            nickname: None,
+            preferences: Preferences {
+                theme: "dark".to_owned(),
+            },
+        }
+    );
+    assert!(typed_missing.is_none());
+    assert_typed_results(&typed_results);
+    assert_eq!(
         scan_keys,
         vec![
             b"row-single".to_vec(),
@@ -115,6 +148,90 @@ async fn raw_and_high_level_clients_cover_reads_and_bulk_mutations() {
             b"row-range".to_vec(),
         ]
     );
+}
+
+async fn connect_client(endpoint: String) -> Client {
+    let config = ClientConfig::new(PROJECT_ID, INSTANCE_ID)
+        .expect("valid config")
+        .with_emulator_host(endpoint)
+        .expect("valid emulator")
+        .with_channel_pool_size(2)
+        .expect("valid channel pool");
+    let client = Client::connect(config)
+        .await
+        .expect("client connects without credentials");
+    assert!(client.config().uses_emulator());
+    assert_eq!(client.config().channel_pool_size(), 2);
+    client
+}
+
+async fn write_typed_fixture(client: &Client, table_id: &str) {
+    let bulk = BulkMutation::new(table_id)
+        .expect("valid table")
+        .entry(typed_row(b"typed-z", b"Zoe", b"42"))
+        .expect("nonempty row")
+        .entry(typed_row(b"typed-m", b"Mal", b"many"))
+        .expect("nonempty row")
+        .entry(typed_row(b"typed-a", b"Ada", b"37"))
+        .expect("nonempty row");
+
+    let result = client
+        .mutate_rows(bulk)
+        .await
+        .expect("typed fixture writes succeed");
+    assert_eq!(result.entries(), 3);
+}
+
+fn typed_row(row_key: &[u8], name: &[u8], age: &[u8]) -> RowMutation {
+    RowMutation::new(row_key.to_vec())
+        .expect("valid row")
+        .mutation(Mutation::set_cell(FAMILY, b"name".to_vec(), name.to_vec()).expect("valid name"))
+        .expect("within limit")
+        .mutation(Mutation::set_cell(FAMILY, b"age".to_vec(), age.to_vec()).expect("valid age"))
+        .expect("within limit")
+        .mutation(
+            Mutation::set_cell(
+                FAMILY,
+                b"preferences".to_vec(),
+                br#"{"theme":"dark"}"#.to_vec(),
+            )
+            .expect("valid preferences"),
+        )
+        .expect("within limit")
+}
+
+async fn read_typed_fixture(client: &Client, table_id: &str) -> Vec<Result<TypedUser, Error>> {
+    let query = Query::new(table_id)
+        .expect("valid table")
+        .prefix(b"typed-".to_vec())
+        .reversed();
+    let mut rows = client
+        .read_rows_as_with_options(query, ReadOptions::default())
+        .await
+        .expect("typed scan starts");
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await {
+        results.push(row);
+    }
+    results
+}
+
+fn assert_typed_results(results: &[Result<TypedUser, Error>]) {
+    assert_eq!(results.len(), 3);
+    assert!(matches!(
+        &results[0],
+        Ok(user) if user.key == "typed-z" && user.age == 42
+    ));
+    assert!(matches!(
+        &results[1],
+        Err(Error::RowMapping(error))
+            if error.row_key().as_ref() == b"typed-m"
+                && matches!(error.issue(), RowMappingIssue::InvalidValue { .. })
+    ));
+    assert!(matches!(
+        &results[2],
+        Ok(user) if user.key == "typed-a" && user.age == 37
+    ));
 }
 
 async fn connect_admin(endpoint: &str) -> BigtableTableAdminClient<tonic::transport::Channel> {

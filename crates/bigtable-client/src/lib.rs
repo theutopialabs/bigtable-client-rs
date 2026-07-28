@@ -1,8 +1,9 @@
 //! An async Rust client for Google Cloud Bigtable.
 //!
-//! The high-level API provides row queries, streamed row assembly, atomic row
-//! mutations, bulk writes, partial retries, and operation deadlines. The
-//! generated Tonic client remains available for direct data API calls.
+//! The high-level API provides row queries, streamed row assembly, typed row
+//! mapping, atomic row mutations, bulk writes, partial retries, and operation
+//! deadlines. The generated Tonic client remains available for direct data API
+//! calls.
 //!
 //! # Quick start
 //!
@@ -22,12 +23,38 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Typed rows
+//!
+//! ```no_run
+//! use bigtable_client::{Client, FromRow};
+//!
+//! #[derive(Debug, FromRow)]
+//! #[bigtable(family = "profile")]
+//! struct User {
+//!     #[bigtable(row_key)]
+//!     key: String,
+//!     name: String,
+//!     nickname: Option<String>,
+//! }
+//!
+//! # async fn read(client: &Client) -> Result<(), bigtable_client::Error> {
+//! let user = client
+//!     .read_row_as::<User>("users", b"user#42".to_vec())
+//!     .await?;
+//! println!("{user:?}");
+//! # Ok(())
+//! # }
+//! ```
+
+extern crate self as bigtable_client;
 
 mod auth;
 mod channel;
 mod client;
 mod config;
 mod error;
+mod mapping;
 mod merge;
 mod mutation;
 mod query;
@@ -37,13 +64,16 @@ mod retry;
 mod row;
 mod write;
 
+pub use bigtable_client_derive::FromRow;
 pub use client::{AuthInterceptor, Client, RawClient};
 pub use config::ClientConfig;
 pub use error::{
     BulkMutationError, BulkMutationPolicyIssue, ConfigField, ConfigIssue, Error,
     MutateRowsResponseIssue, MutationFailure, MutationFailureCause, MutationIssue, QueryIssue,
-    ReadPolicyIssue, RowMergeIssue,
+    ReadPolicyIssue, RowMappingError, RowMappingIssue, RowMergeIssue, RowValueLocation,
+    ValueDecodeError,
 };
+pub use mapping::{DecodedCell, FromCellValue, FromJsonValue, FromRow, RowDecoder, TypedRowStream};
 pub use mutation::{BulkMutation, Mutation, RowMutation};
 pub use query::{Query, RowBound, RowRange};
 pub use read::RowStream;
