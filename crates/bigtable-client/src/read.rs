@@ -15,9 +15,10 @@ use tokio::{
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{
-    Request, Status,
+    Code, Request, Status,
     metadata::{Ascii, MetadataValue},
 };
+use tracing::Instrument;
 
 use crate::{
     ClientConfig, Error, Query, RawClient, ReadOptions, Row,
@@ -27,6 +28,10 @@ use crate::{
         row_range::{EndKey, StartKey},
     },
     retry,
+    telemetry::{
+        AttemptSummary, AttemptTracker, BigtableOperation, OperationHandle, OperationSummary,
+        OperationTracker, Telemetry,
+    },
 };
 
 const STREAM_BUFFER: usize = 16;
@@ -82,27 +87,48 @@ impl ReadRowsService for TonicReadRowsService {
 pub(crate) async fn start(
     raw: RawClient,
     config: &ClientConfig,
+    telemetry: Telemetry,
     query: Query,
     options: ReadOptions,
 ) -> Result<RowStream, Error> {
-    start_with_service(
+    start_with_service_and_telemetry(
         Arc::new(TonicReadRowsService { raw }),
         config,
+        telemetry,
         query,
         options,
     )
     .await
 }
 
-async fn start_with_service(
+async fn start_with_service_and_telemetry(
     service: Arc<dyn ReadRowsService>,
     config: &ClientConfig,
+    telemetry: Telemetry,
     query: Query,
     options: ReadOptions,
 ) -> Result<RowStream, Error> {
     retry::validate(&options)?;
+    let table_id = query.table_id().to_owned();
     let request = query.into_request(config);
-    let mut operation = ReadOperation::new(service, request, options)?;
+    let routing = format!("table_name={}", request.table_name)
+        .parse()
+        .map_err(|source| Error::InvalidClientMetadata {
+            header: "x-goog-request-params",
+            source,
+        })?;
+    let deadline = Instant::now()
+        .checked_add(options.deadlines.operation_timeout)
+        .ok_or_else(|| Error::invalid_read_policy(crate::ReadPolicyIssue::DeadlineTooLarge))?;
+    let operation_telemetry = telemetry.operation(config, BigtableOperation::ReadRows, table_id, 0);
+    let mut operation = ReadOperation::new(
+        service,
+        request,
+        routing,
+        options,
+        deadline,
+        operation_telemetry,
+    );
     let active = match operation.open(None, None).await? {
         OpenResult::Active(active) => active,
         OpenResult::Complete | OpenResult::Cancelled => {
@@ -120,6 +146,23 @@ async fn start_with_service(
     })
 }
 
+#[cfg(test)]
+async fn start_with_service(
+    service: Arc<dyn ReadRowsService>,
+    config: &ClientConfig,
+    query: Query,
+    options: ReadOptions,
+) -> Result<RowStream, Error> {
+    start_with_service_and_telemetry(
+        service,
+        config,
+        Telemetry::from_observer(None),
+        query,
+        options,
+    )
+    .await
+}
+
 struct ReadOperation {
     service: Arc<dyn ReadRowsService>,
     original: ReadRowsRequest,
@@ -130,11 +173,26 @@ struct ReadOperation {
     rows_returned: i64,
     progress: Option<Bytes>,
     merger: RowMerger,
+    telemetry: OperationTracker,
 }
 
 struct ActiveAttempt {
     stream: ResponseStream,
     deadline: Instant,
+    rows: u64,
+    telemetry: AttemptTracker,
+}
+
+impl ActiveAttempt {
+    fn finish(&mut self, code: Code) {
+        self.telemetry.finish(
+            code,
+            AttemptSummary {
+                rows: self.rows,
+                ..AttemptSummary::default()
+            },
+        );
+    }
 }
 
 enum OpenResult {
@@ -147,20 +205,14 @@ impl ReadOperation {
     fn new(
         service: Arc<dyn ReadRowsService>,
         original: ReadRowsRequest,
+        routing: MetadataValue<Ascii>,
         options: ReadOptions,
-    ) -> Result<Self, Error> {
-        let routing = format!("table_name={}", original.table_name)
-            .parse()
-            .map_err(|source| Error::InvalidClientMetadata {
-                header: "x-goog-request-params",
-                source,
-            })?;
-        let deadline = Instant::now()
-            .checked_add(options.deadlines.operation_timeout)
-            .ok_or_else(|| Error::invalid_read_policy(crate::ReadPolicyIssue::DeadlineTooLarge))?;
+        deadline: Instant,
+        telemetry: OperationTracker,
+    ) -> Self {
         let reversed = original.reversed;
 
-        Ok(Self {
+        Self {
             service,
             original,
             routing,
@@ -170,32 +222,67 @@ impl ReadOperation {
             rows_returned: 0,
             progress: None,
             merger: RowMerger::new(reversed),
-        })
+            telemetry,
+        }
+    }
+
+    fn telemetry(&self) -> OperationHandle {
+        self.telemetry.handle()
     }
 
     async fn run(mut self, mut active: ActiveAttempt, sender: mpsc::Sender<Result<Row, Error>>) {
         loop {
             let message_deadline = active.deadline.min(self.deadline);
             let next = tokio::select! {
-                () = sender.closed() => return,
-                next = timeout_at(message_deadline, active.stream.next()) => next,
+                () = sender.closed() => {
+                    active.finish(Code::Cancelled);
+                    self.finish(Code::Cancelled);
+                    return;
+                },
+                next = timeout_at(message_deadline, active.stream.next())
+                    .instrument(active.telemetry.span()) => next,
             };
             match next {
-                Ok(Some(Ok(response))) => match self.handle_response(response, &sender).await {
-                    Ok(true) => {}
-                    Ok(false) => return,
-                    Err(error) => {
-                        send_terminal(&sender, error).await;
-                        return;
+                Ok(Some(Ok(response))) => {
+                    active.telemetry.first_response();
+                    let before = self.rows_returned;
+                    match self.handle_response(response, &sender).await {
+                        Ok(true) => {
+                            active.rows = active.rows.saturating_add(
+                                u64::try_from(self.rows_returned.saturating_sub(before))
+                                    .unwrap_or(u64::MAX),
+                            );
+                            if self.limit_reached() {
+                                active.finish(Code::Ok);
+                                self.finish(Code::Ok);
+                                return;
+                            }
+                        }
+                        Ok(false) => {
+                            active.finish(Code::Cancelled);
+                            self.finish(Code::Cancelled);
+                            return;
+                        }
+                        Err(error) => {
+                            active.finish(Code::Unknown);
+                            self.finish(Code::Unknown);
+                            send_terminal(&sender, error).await;
+                            return;
+                        }
                     }
-                },
+                }
                 Ok(None) => {
+                    active.finish(Code::Ok);
                     if let Err(issue) = self.merger.finish() {
+                        self.finish(Code::Unknown);
                         send_terminal(&sender, Error::InvalidReadRowsResponse { issue }).await;
+                    } else {
+                        self.finish(Code::Ok);
                     }
                     return;
                 }
                 Ok(Some(Err(status))) => {
+                    active.finish(status.code());
                     self.merger.discard_partial();
                     match self.open(Some(status), Some(&sender)).await {
                         Ok(OpenResult::Active(next_attempt)) => active = next_attempt,
@@ -207,6 +294,7 @@ impl ReadOperation {
                     }
                 }
                 Err(_) => {
+                    active.finish(Code::DeadlineExceeded);
                     self.merger.discard_partial();
                     let status = Status::deadline_exceeded("ReadRows attempt deadline exceeded");
                     match self.open(Some(status), Some(&sender)).await {
@@ -242,7 +330,10 @@ impl ReadOperation {
             {
                 self.rows_returned += 1;
                 self.progress = Some(row.key.clone());
-                if sender.send(Ok(row)).await.is_err() {
+                let blocked = Instant::now();
+                let sent = sender.send(Ok(row)).await;
+                self.telemetry().application_blocked(blocked.elapsed());
+                if sent.is_err() {
                     return Ok(false);
                 }
             }
@@ -257,11 +348,13 @@ impl ReadOperation {
     ) -> Result<OpenResult, Error> {
         loop {
             if Instant::now() >= self.deadline {
+                self.finish(Code::DeadlineExceeded);
                 return Err(self.deadline_error());
             }
             if let Some(status) = failure.take() {
                 if !retry::is_retryable(&status) || self.attempts >= self.options.retry.max_attempts
                 {
+                    self.finish(status.code());
                     return Err(Error::ReadRows {
                         attempts: self.attempts,
                         source: status,
@@ -271,17 +364,17 @@ impl ReadOperation {
                     .max(retry::retry_delay(&status).unwrap_or(Duration::ZERO));
                 let remaining = self.remaining()?;
                 if delay >= remaining {
+                    self.finish(Code::DeadlineExceeded);
                     return Err(self.deadline_error());
                 }
-                tracing::warn!(
-                    attempt = self.attempts,
-                    code = ?status.code(),
-                    delay_ms = delay.as_millis(),
-                    "retrying Bigtable ReadRows"
-                );
+                self.telemetry()
+                    .retry(None, self.attempts, status.code(), delay, 0);
                 if let Some(sender) = sender {
                     tokio::select! {
-                        () = sender.closed() => return Ok(OpenResult::Cancelled),
+                        () = sender.closed() => {
+                            self.finish(Code::Cancelled);
+                            return Ok(OpenResult::Cancelled);
+                        },
                         () = tokio::time::sleep(delay) => {}
                     }
                 } else {
@@ -292,6 +385,7 @@ impl ReadOperation {
             let Some(message) =
                 resume_request(&self.original, self.progress.as_deref(), self.rows_returned)
             else {
+                self.finish(Code::Ok);
                 return Ok(OpenResult::Complete);
             };
             let remaining = self.remaining()?;
@@ -307,10 +401,18 @@ impl ReadOperation {
             request.set_timeout(attempt_timeout);
             self.attempts += 1;
 
-            let attempt = timeout(attempt_timeout, self.service.read_rows(request));
+            let mut telemetry = self
+                .telemetry()
+                .attempt(None, self.attempts, 0, attempt_timeout);
+            let attempt = timeout(attempt_timeout, self.service.read_rows(request))
+                .instrument(telemetry.span());
             let result = if let Some(sender) = sender {
                 tokio::select! {
-                    () = sender.closed() => return Ok(OpenResult::Cancelled),
+                    () = sender.closed() => {
+                        telemetry.finish(Code::Cancelled, AttemptSummary::default());
+                        self.finish(Code::Cancelled);
+                        return Ok(OpenResult::Cancelled);
+                    },
                     result = attempt => result,
                 }
             } else {
@@ -321,10 +423,16 @@ impl ReadOperation {
                     return Ok(OpenResult::Active(ActiveAttempt {
                         stream,
                         deadline: attempt_deadline,
+                        rows: 0,
+                        telemetry,
                     }));
                 }
-                Ok(Err(status)) => failure = Some(status),
+                Ok(Err(status)) => {
+                    telemetry.finish(status.code(), AttemptSummary::default());
+                    failure = Some(status);
+                }
                 Err(_) => {
+                    telemetry.finish(Code::DeadlineExceeded, AttemptSummary::default());
                     failure = Some(Status::deadline_exceeded(
                         "ReadRows attempt deadline exceeded",
                     ));
@@ -333,11 +441,17 @@ impl ReadOperation {
         }
     }
 
-    fn remaining(&self) -> Result<Duration, Error> {
-        self.deadline
+    fn remaining(&mut self) -> Result<Duration, Error> {
+        let remaining = self
+            .deadline
             .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| self.deadline_error())
+            .filter(|remaining| !remaining.is_zero());
+        if let Some(remaining) = remaining {
+            Ok(remaining)
+        } else {
+            self.finish(Code::DeadlineExceeded);
+            Err(self.deadline_error())
+        }
     }
 
     fn deadline_error(&self) -> Error {
@@ -345,6 +459,20 @@ impl ReadOperation {
             attempts: self.attempts,
             timeout: self.options.deadlines.operation_timeout,
         }
+    }
+
+    fn limit_reached(&self) -> bool {
+        self.original.rows_limit > 0 && self.rows_returned >= self.original.rows_limit
+    }
+
+    fn finish(&mut self, code: Code) {
+        self.telemetry.finish(
+            code,
+            OperationSummary {
+                rows: u64::try_from(self.rows_returned).unwrap_or(u64::MAX),
+                ..OperationSummary::default()
+            },
+        );
     }
 }
 
@@ -481,16 +609,18 @@ mod tests {
     use tonic::{Code, Request, Status};
 
     use super::{
-        ReadRowsService, ResponseStream, resume_request, start_with_service, trim_row_set,
+        ReadRowsService, ResponseStream, resume_request, start_with_service,
+        start_with_service_and_telemetry, trim_row_set,
     };
     use crate::{
-        ClientConfig, DeadlinePolicy, Error, Jitter, Query, ReadOptions, RetryPolicy, RowBound,
-        RowMergeIssue, RowRange,
+        ClientConfig, DeadlinePolicy, DiagnosticEvent, Error, Jitter, Query, ReadOptions,
+        RetryPolicy, RowBound, RowMergeIssue, RowRange,
         proto::{
             ReadRowsRequest, ReadRowsResponse, RowSet,
             read_rows_response::{CellChunk, cell_chunk::RowStatus},
             row_range::{EndKey, StartKey},
         },
+        telemetry::recorded_telemetry,
     };
 
     enum Script {
@@ -681,6 +811,92 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn diagnostics_cover_stream_retry_and_final_summary() {
+        let service = Arc::new(FakeService::new([
+            Script::Stream(vec![
+                Ok(row_response(b"a", b"first")),
+                Err(Status::unavailable("retry")),
+            ]),
+            Script::Stream(vec![Ok(row_response(b"b", b"second"))]),
+        ]));
+        let (telemetry, events) = recorded_telemetry();
+        let mut stream = start_with_service_and_telemetry(
+            service,
+            &config(),
+            telemetry,
+            Query::new("table").expect("valid query"),
+            options(),
+        )
+        .await
+        .expect("read starts");
+
+        assert!(stream.next().await.expect("first row").is_ok());
+        assert!(stream.next().await.expect("second row").is_ok());
+        assert!(stream.next().await.is_none());
+
+        let events = events.lock().expect("diagnostics lock");
+        assert_eq!(events.len(), 9);
+        assert!(matches!(
+            events[0],
+            DiagnosticEvent::OperationStarted {
+                table_id: ref table,
+                entries: 0,
+                ..
+            } if table == "table"
+        ));
+        assert!(matches!(
+            events[1],
+            DiagnosticEvent::AttemptStarted {
+                batch: None,
+                attempt: 1,
+                entries: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[2],
+            DiagnosticEvent::FirstResponse { attempt: 1, .. }
+        ));
+        assert!(matches!(
+            events[3],
+            DiagnosticEvent::AttemptFinished {
+                attempt: 1,
+                code: Code::Unavailable,
+                rows: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[4],
+            DiagnosticEvent::RetryScheduled {
+                attempt: 1,
+                code: Code::Unavailable,
+                pending_entries: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[7],
+            DiagnosticEvent::AttemptFinished {
+                attempt: 2,
+                code: Code::Ok,
+                rows: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[8],
+            DiagnosticEvent::OperationFinished {
+                code: Code::Ok,
+                attempts: 2,
+                retries: 1,
+                rows: 2,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn scan_marker_trims_filtered_work_and_row_limit() {
         let service = Arc::new(FakeService::new([
             Script::Stream(vec![
@@ -850,9 +1066,11 @@ mod tests {
     async fn dropping_row_stream_cancels_the_active_rpc() {
         let dropped = Arc::new(AtomicBool::new(false));
         let service = Arc::new(FakeService::new([Script::PendingDrop(dropped.clone())]));
-        let stream = start_with_service(
+        let (telemetry, events) = recorded_telemetry();
+        let stream = start_with_service_and_telemetry(
             service,
             &config(),
+            telemetry,
             Query::new("table").expect("valid query"),
             options(),
         )
@@ -863,6 +1081,22 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert!(dropped.load(Ordering::SeqCst));
+        let events = events.lock().expect("diagnostics lock");
+        assert!(matches!(
+            events.as_slice(),
+            [
+                DiagnosticEvent::OperationStarted { .. },
+                DiagnosticEvent::AttemptStarted { .. },
+                DiagnosticEvent::AttemptFinished {
+                    code: Code::Cancelled,
+                    ..
+                },
+                DiagnosticEvent::OperationFinished {
+                    code: Code::Cancelled,
+                    ..
+                }
+            ]
+        ));
     }
 
     #[test]

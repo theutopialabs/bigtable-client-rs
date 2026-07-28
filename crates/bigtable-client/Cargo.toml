@@ -12,7 +12,9 @@ repository.workspace = true
 publish = false
 
 [features]
+default = ["opentelemetry"]
 emulator-tests = []
+opentelemetry = ["dep:opentelemetry"]
 
 [dependencies]
 arc-swap.workspace = true
@@ -29,6 +31,7 @@ googleapis-tonic-google-bigtable-v2.workspace = true
 googleapis-tonic-google-rpc.workspace = true
 http.workspace = true
 humantime-serde.workspace = true
+opentelemetry = { workspace = true, optional = true }
 prost.workspace = true
 prost-types.workspace = true
 serde.workspace = true
@@ -42,7 +45,9 @@ tracing.workspace = true
 [dev-dependencies]
 figment = { workspace = true, features = ["test"] }
 googleapis-tonic-google-bigtable-admin-v2.workspace = true
+opentelemetry_sdk.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true
 trybuild.workspace = true
 
 [lints]

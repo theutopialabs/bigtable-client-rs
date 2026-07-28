@@ -11,6 +11,7 @@ use tonic::{
     Code, Request, Status,
     metadata::{Ascii, MetadataValue},
 };
+use tracing::Instrument;
 
 use crate::{
     BulkMutation, BulkMutationError, BulkMutationPolicyIssue, ClientConfig, Error,
@@ -18,6 +19,7 @@ use crate::{
     proto::{MutateRowsRequest, MutateRowsResponse, mutate_rows_request},
     resource::table_name,
     retry::{self, DeadlinePolicy, PolicyIssue, RetryPolicy},
+    telemetry::{AttemptSummary, BigtableOperation, OperationHandle, OperationSummary, Telemetry},
 };
 
 const DEFAULT_MAX_ENTRIES_PER_REQUEST: usize = 100;
@@ -130,21 +132,24 @@ impl MutateRowsService for TonicMutateRowsService {
 pub(crate) async fn execute(
     raw: RawClient,
     config: &ClientConfig,
+    telemetry: Telemetry,
     mutation: BulkMutation,
     options: BulkMutationOptions,
 ) -> Result<BulkMutationResult, Error> {
-    execute_with_service(
+    execute_with_service_and_telemetry(
         Arc::new(TonicMutateRowsService { raw }),
         config,
+        telemetry,
         mutation,
         options,
     )
     .await
 }
 
-async fn execute_with_service(
+async fn execute_with_service_and_telemetry(
     service: Arc<dyn MutateRowsService>,
     config: &ClientConfig,
+    telemetry: Telemetry,
     mutation: BulkMutation,
     options: BulkMutationOptions,
 ) -> Result<BulkMutationResult, Error> {
@@ -171,13 +176,21 @@ async fn execute_with_service(
     let request_batches = batches.len();
     let max_in_flight = options.batch.max_in_flight_requests;
     let app_profile_id = config.app_profile_id().to_owned();
-    let outcomes = stream::iter(batches)
-        .map(|entries| {
+    let mut operation = telemetry.operation(
+        config,
+        BigtableOperation::MutateRows,
+        table_id,
+        total_entries,
+    );
+    let operation_handle = operation.handle();
+    let outcomes = stream::iter(batches.into_iter().enumerate())
+        .map(|(batch, entries)| {
             let service = Arc::clone(&service);
             let options = options.clone();
             let table_name = table_name.clone();
             let app_profile_id = app_profile_id.clone();
             let routing = routing.clone();
+            let telemetry = operation_handle.clone();
             async move {
                 BatchOperation {
                     service,
@@ -190,6 +203,8 @@ async fn execute_with_service(
                     successful: 0,
                     failures: Vec::new(),
                     rpc_attempts: 0,
+                    batch,
+                    telemetry,
                 }
                 .run()
                 .await
@@ -210,12 +225,27 @@ async fn execute_with_service(
     failures.sort_by_key(MutationFailure::index);
 
     if failures.is_empty() {
+        operation.finish(
+            Code::Ok,
+            OperationSummary {
+                successful_entries,
+                ..OperationSummary::default()
+            },
+        );
         Ok(BulkMutationResult {
             entries: successful_entries,
             rpc_attempts,
             request_batches,
         })
     } else {
+        operation.finish(
+            mutation_failures_code(&failures),
+            OperationSummary {
+                successful_entries,
+                failed_entries: failures.len(),
+                ..OperationSummary::default()
+            },
+        );
         Err(BulkMutationError {
             total_entries,
             successful_entries,
@@ -224,6 +254,23 @@ async fn execute_with_service(
         }
         .into())
     }
+}
+
+#[cfg(test)]
+async fn execute_with_service(
+    service: Arc<dyn MutateRowsService>,
+    config: &ClientConfig,
+    mutation: BulkMutation,
+    options: BulkMutationOptions,
+) -> Result<BulkMutationResult, Error> {
+    execute_with_service_and_telemetry(
+        service,
+        config,
+        Telemetry::from_observer(None),
+        mutation,
+        options,
+    )
+    .await
 }
 
 fn validate_options(options: &BulkMutationOptions) -> Result<(), Error> {
@@ -345,6 +392,8 @@ struct BatchOperation {
     successful: usize,
     failures: Vec<MutationFailure>,
     rpc_attempts: u32,
+    batch: usize,
+    telemetry: OperationHandle,
 }
 
 struct BatchOutcome {
@@ -368,18 +417,41 @@ impl BatchOperation {
             let attempt_deadline = Instant::now()
                 .checked_add(self.options.deadlines.attempt_timeout)
                 .map_or(self.deadline, |deadline| deadline.min(self.deadline));
+            let attempt_timeout = attempt_deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO);
             let request = self.request(&current, attempt_deadline);
-            let result = timeout_at(attempt_deadline, self.service.mutate_rows(request)).await;
+            let mut attempt_telemetry = self.telemetry.attempt(
+                Some(self.batch),
+                self.rpc_attempts,
+                current.len(),
+                attempt_timeout,
+            );
+            let result = timeout_at(attempt_deadline, self.service.mutate_rows(request))
+                .instrument(attempt_telemetry.span())
+                .await;
             let attempt = match result {
-                Ok(Ok(stream)) => self.consume_stream(current, stream, attempt_deadline).await,
+                Ok(Ok(stream)) => {
+                    self.consume_stream(current, stream, attempt_deadline, &mut attempt_telemetry)
+                        .await
+                }
                 Ok(Err(status)) => self.rpc_failure(current, &status),
                 Err(_) => self.rpc_failure(
                     current,
                     &Status::deadline_exceeded("MutateRows attempt deadline exceeded"),
                 ),
             };
+            attempt_telemetry.finish(
+                attempt.code,
+                AttemptSummary {
+                    successful_entries: attempt.successful,
+                    failed_entries: attempt.failures.len() + attempt.retry.len(),
+                    ..AttemptSummary::default()
+                },
+            );
             self.successful += attempt.successful;
             self.failures.extend(attempt.failures);
+            let retry_code = attempt.code;
             self.pending = attempt.retry;
 
             if self.pending.is_empty() {
@@ -401,11 +473,12 @@ impl BatchOperation {
                 self.fail_pending_deadline();
                 break;
             }
-            tracing::warn!(
-                entries = self.pending.len(),
-                attempt = failed_attempt,
-                delay_ms = delay.as_millis(),
-                "retrying unresolved Bigtable MutateRows entries"
+            self.telemetry.retry(
+                Some(self.batch),
+                failed_attempt,
+                retry_code,
+                delay,
+                self.pending.len(),
             );
             if timeout_at(self.deadline, tokio::time::sleep(delay))
                 .await
@@ -448,14 +521,19 @@ impl BatchOperation {
         current: Vec<PendingEntry>,
         mut stream: ResponseStream,
         attempt_deadline: Instant,
+        telemetry: &mut crate::telemetry::AttemptTracker,
     ) -> AttemptOutcome {
         let mut results = (0..current.len()).map(|_| None).collect::<Vec<_>>();
         let mut stream_failure = None;
         let mut protocol_issue = None;
 
         loop {
-            match timeout_at(attempt_deadline, stream.next()).await {
+            match timeout_at(attempt_deadline, stream.next())
+                .instrument(telemetry.span())
+                .await
+            {
                 Ok(Some(Ok(response))) => {
+                    telemetry.first_response();
                     for result in response.entries {
                         let Ok(index) = usize::try_from(result.index) else {
                             protocol_issue = Some(MutateRowsResponseIssue::NegativeIndex {
@@ -497,6 +575,7 @@ impl BatchOperation {
 
         if let Some(issue) = protocol_issue {
             return AttemptOutcome {
+                code: Code::Unknown,
                 successful: 0,
                 failures: current
                     .into_iter()
@@ -529,6 +608,7 @@ impl BatchOperation {
                             &mut outcome,
                         );
                     } else {
+                        outcome.code = Code::Unknown;
                         outcome.failures.push(MutationFailure {
                             index: entry.original_index,
                             attempts: entry.attempts,
@@ -544,7 +624,10 @@ impl BatchOperation {
     }
 
     fn rpc_failure(&self, current: Vec<PendingEntry>, status: &Status) -> AttemptOutcome {
-        let mut outcome = AttemptOutcome::default();
+        let mut outcome = AttemptOutcome {
+            code: status.code(),
+            ..AttemptOutcome::default()
+        };
         for entry in current {
             self.classify_status(entry, status.clone(), FailureOrigin::Rpc, &mut outcome);
         }
@@ -562,6 +645,9 @@ impl BatchOperation {
             && retry::is_mutate_retryable(&status)
             && entry.attempts < self.options.retry.max_attempts;
         if can_retry {
+            if outcome.code == Code::Ok {
+                outcome.code = status.code();
+            }
             outcome.retry_delay = outcome
                 .retry_delay
                 .max(retry::retry_delay(&status).unwrap_or(Duration::ZERO));
@@ -570,6 +656,9 @@ impl BatchOperation {
         }
 
         let retry_safe = entry.retry_safe;
+        if outcome.code == Code::Ok {
+            outcome.code = status.code();
+        }
         let cause = match origin {
             FailureOrigin::Entry => MutationFailureCause::EntryStatus { status, retry_safe },
             FailureOrigin::Rpc => MutationFailureCause::RpcStatus { status, retry_safe },
@@ -593,12 +682,24 @@ impl BatchOperation {
     }
 }
 
-#[derive(Default)]
 struct AttemptOutcome {
+    code: Code,
     successful: usize,
     failures: Vec<MutationFailure>,
     retry: Vec<PendingEntry>,
     retry_delay: Duration,
+}
+
+impl Default for AttemptOutcome {
+    fn default() -> Self {
+        Self {
+            code: Code::Ok,
+            successful: 0,
+            failures: Vec::new(),
+            retry: Vec::new(),
+            retry_delay: Duration::ZERO,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -619,6 +720,18 @@ fn status_result(status: Option<RpcStatus>) -> Result<(), Status> {
         message,
         Bytes::from(status.encode_to_vec()),
     ))
+}
+
+fn mutation_failures_code(failures: &[MutationFailure]) -> Code {
+    failures
+        .iter()
+        .next()
+        .map_or(Code::Unknown, |failure| match failure.cause() {
+            MutationFailureCause::EntryStatus { status, .. }
+            | MutationFailureCause::RpcStatus { status, .. } => status.code(),
+            MutationFailureCause::DeadlineExceeded { .. } => Code::DeadlineExceeded,
+            MutationFailureCause::InvalidResponse { .. } => Code::Unknown,
+        })
 }
 
 #[cfg(test)]
@@ -645,15 +758,17 @@ mod tests {
 
     use super::{
         BatchPolicy, BulkMutationOptions, BulkMutationResult, MutateRowsService, ResponseStream,
-        execute_with_service, repeated_message_size, split_batches, validate_options, varint_size,
+        execute_with_service, execute_with_service_and_telemetry, repeated_message_size,
+        split_batches, validate_options, varint_size,
     };
     use crate::{
-        BulkMutation, BulkMutationPolicyIssue, ClientConfig, DeadlinePolicy, Error, Jitter,
-        MutateRowsResponseIssue, Mutation, MutationFailureCause, RowMutation,
+        BulkMutation, BulkMutationPolicyIssue, ClientConfig, DeadlinePolicy, DiagnosticEvent,
+        Error, Jitter, MutateRowsResponseIssue, Mutation, MutationFailureCause, RowMutation,
         proto::{
             MutateRowsRequest, MutateRowsResponse, mutate_rows_response::Entry as ResponseEntry,
         },
         retry::RetryPolicy,
+        telemetry::recorded_telemetry,
     };
 
     enum Script {
@@ -838,6 +953,70 @@ mod tests {
         }
     }
 
+    fn assert_partial_retry_diagnostics(events: &[DiagnosticEvent]) {
+        assert_eq!(events.len(), 9);
+        assert!(matches!(
+            events[0],
+            DiagnosticEvent::OperationStarted {
+                table_id: ref table,
+                entries: 3,
+                ..
+            } if table == "events"
+        ));
+        assert!(matches!(
+            events[1],
+            DiagnosticEvent::AttemptStarted {
+                batch: Some(0),
+                attempt: 1,
+                entries: 3,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[3],
+            DiagnosticEvent::AttemptFinished {
+                batch: Some(0),
+                attempt: 1,
+                code: Code::Unavailable,
+                successful_entries: 1,
+                failed_entries: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[4],
+            DiagnosticEvent::RetryScheduled {
+                batch: Some(0),
+                attempt: 1,
+                code: Code::Unavailable,
+                pending_entries: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[7],
+            DiagnosticEvent::AttemptFinished {
+                batch: Some(0),
+                attempt: 2,
+                code: Code::Ok,
+                successful_entries: 1,
+                failed_entries: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[8],
+            DiagnosticEvent::OperationFinished {
+                code: Code::InvalidArgument,
+                attempts: 2,
+                retries: 1,
+                successful_entries: 2,
+                failed_entries: 1,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn defaults_match_google_bulk_write_guidance() {
         let options = BulkMutationOptions::default();
@@ -941,9 +1120,11 @@ mod tests {
             ]))]),
             Script::SuccessAll,
         ]));
-        let error = execute_with_service(
+        let (telemetry, events) = recorded_telemetry();
+        let error = execute_with_service_and_telemetry(
             service.clone(),
             &config(),
+            telemetry,
             bulk([
                 safe_row(b"a".to_vec()),
                 safe_row(b"b".to_vec()),
@@ -971,6 +1152,10 @@ mod tests {
         let requests = service.requests.lock().await;
         assert_eq!(requests[1].message.entries.len(), 1);
         assert_eq!(requests[1].message.entries[0].row_key.as_ref(), b"b");
+        drop(requests);
+
+        let events = events.lock().expect("diagnostics lock");
+        assert_partial_retry_diagnostics(&events);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1365,10 +1550,12 @@ mod tests {
         bounded.batch.max_entries_per_request = 1;
         bounded.batch.max_in_flight_requests = 2;
         let task_service = service.clone();
+        let (telemetry, events) = recorded_telemetry();
         let task = tokio::spawn(async move {
-            execute_with_service(
+            execute_with_service_and_telemetry(
                 task_service,
                 &config(),
+                telemetry,
                 bulk((0..4).map(|index| safe_row(format!("row-{index}").into_bytes()))),
                 bounded,
             )
@@ -1389,6 +1576,37 @@ mod tests {
         assert!(first_dropped.load(Ordering::SeqCst));
         assert!(second_dropped.load(Ordering::SeqCst));
         assert_eq!(service.requests.lock().await.len(), 2);
+
+        let events = events.lock().expect("diagnostics lock");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, DiagnosticEvent::AttemptStarted { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    DiagnosticEvent::AttemptFinished {
+                        code: Code::Cancelled,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+        assert!(matches!(
+            events.last(),
+            Some(DiagnosticEvent::OperationFinished {
+                code: Code::Cancelled,
+                attempts: 2,
+                retries: 0,
+                ..
+            })
+        ));
     }
 
     #[test]

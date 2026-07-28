@@ -160,6 +160,10 @@ impl Query {
         self
     }
 
+    pub(crate) fn table_id(&self) -> &str {
+        &self.table_id
+    }
+
     pub(crate) fn into_request(self, config: &ClientConfig) -> ReadRowsRequest {
         let rows = if self.row_keys.is_empty() && self.row_ranges.is_empty() {
             None

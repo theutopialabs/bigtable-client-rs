@@ -2,8 +2,9 @@
 //!
 //! The high-level API provides row queries, streamed row assembly, typed row
 //! mapping, atomic row mutations, bulk writes, partial retries, and operation
-//! deadlines. The generated Tonic client remains available for direct data API
-//! calls.
+//! deadlines. High-level operations expose tracing spans, OpenTelemetry
+//! metrics, and structured diagnostics. The generated Tonic client remains
+//! available for direct data API calls.
 //!
 //! # Quick start
 //!
@@ -46,6 +47,23 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Request diagnostics
+//!
+//! ```no_run
+//! use bigtable_client::{Client, ClientConfig, DiagnosticEvent};
+//!
+//! # async fn run() -> Result<(), bigtable_client::Error> {
+//! let client = Client::builder(ClientConfig::new("my-project", "my-instance")?)
+//!     .with_diagnostic_observer(|event: &DiagnosticEvent| {
+//!         println!("{event:?}");
+//!     })
+//!     .connect()
+//!     .await?;
+//! # let _ = client;
+//! # Ok(())
+//! # }
+//! ```
 
 extern crate self as bigtable_client;
 
@@ -62,10 +80,11 @@ mod read;
 mod resource;
 mod retry;
 mod row;
+mod telemetry;
 mod write;
 
 pub use bigtable_client_derive::FromRow;
-pub use client::{AuthInterceptor, Client, RawClient};
+pub use client::{AuthInterceptor, Client, ClientBuilder, RawClient};
 pub use config::ClientConfig;
 pub use error::{
     BulkMutationError, BulkMutationPolicyIssue, ConfigField, ConfigIssue, Error,
@@ -79,6 +98,7 @@ pub use query::{Query, RowBound, RowRange};
 pub use read::RowStream;
 pub use retry::{DeadlinePolicy, Jitter, ReadOptions, RetryPolicy};
 pub use row::{Cell, Column, Family, Row};
+pub use telemetry::{BigtableOperation, DiagnosticEvent, DiagnosticObserver};
 pub use write::{BatchPolicy, BulkMutationOptions, BulkMutationResult};
 
 /// Generated Google Cloud Bigtable v2 types and the raw Tonic client.
