@@ -39,6 +39,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --all-features
 
+  compatibility:
+    name: Compatibility and package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --no-default-features
+      - run: cargo test --workspace --all-targets --no-default-features
+      - run: cargo test --workspace --all-targets --all-features --release
+      - name: Serial instrumentation and stress tests
+        run: >-
+          cargo test -p bigtable-client --lib --all-features --release
+          -- --ignored --test-threads=1
+      - run: cargo package -p bigtable-client-derive
+      - name: Package client
+        run: >-
+          cargo package -p bigtable-client
+          --config
+          'patch.crates-io.bigtable-client-derive.path="crates/bigtable-client-derive"'
+
   emulator:
     name: Bigtable emulator
     runs-on: ubuntu-latest

@@ -2,11 +2,10 @@
 
 An async, production-focused Rust client for Google Cloud Bigtable.
 
-This project is under active development. M4 provides high-level reads and
-writes, typed row mapping, safe partial retries, bounded bulk requests, deadline
-policies, tracing, OpenTelemetry metrics, request diagnostics, and direct access
-to the generated Tonic client. The first supported version will be `0.0.1`
-after M5.
+Version `0.0.1` provides high-level reads and writes, typed row mapping, safe
+partial retries, bounded bulk requests, deadline policies, tracing,
+OpenTelemetry metrics, request diagnostics, and direct access to the generated
+Tonic client.
 
 This crate is not published to crates.io.
 
@@ -27,14 +26,14 @@ This crate is not published to crates.io.
 | Typed row mapping and derive | Available | M3 |
 | Tracing and OpenTelemetry | Available | M4 |
 | Request diagnostics | Available | M4 |
-| Production hardening and `0.0.1` | Planned | M5 |
+| Production hardening and `0.0.1` | Available | M5 |
 
 The client currently covers the Bigtable data API. Instance, cluster, and table
 administration are outside the public API.
 
 ## Installation
 
-Until `0.0.1` is ready, depend on the Git repository:
+Depend on the Git repository:
 
 ```toml
 [dependencies]
@@ -43,7 +42,22 @@ bigtable-client = { git = "https://github.com/theutopialabs/bigtable-client-rs",
 
 Pin a commit with `rev` when you need reproducible builds.
 
-The minimum supported Rust version is 1.88.
+The current source version is `0.0.1`. The crates are not published, and this
+project does not create release tags yet.
+
+## Compatibility and support
+
+The minimum supported Rust version is 1.88. CI checks the default feature set,
+`default-features = false`, release builds, rustdoc, packaged crates, and the
+official Bigtable emulator.
+
+Version `0.0.1` is the first supported source release. The API can still change
+between `0.0.x` versions. Pin a Git revision when an application needs a stable
+build.
+
+The public API covers the Bigtable data service. Use the generated Tonic client
+for data RPCs that do not have a high-level wrapper. Instance, cluster, table,
+backup, and IAM administration are not supported.
 
 ## Quick start
 
@@ -71,6 +85,11 @@ The high-level client adds authorization, routing, `x-goog-api-client`,
 
 Clone `Client` or `RawClient` instead of creating a client per request. Clones
 share channels and token refresh state.
+
+Create one client per application process in most cases. Start with one channel
+and increase `channel_pool_size` only when observed concurrency needs it. Use a
+separate application profile for workloads that need different routing or
+isolation.
 
 ## Row queries
 
@@ -530,6 +549,31 @@ Or call `ClientConfig::load()` to read these environment variables:
 
 Durations accept values such as `500ms`, `10s`, and `2m`.
 
+## Service limits
+
+The high-level API rejects inputs that exceed these hard Bigtable limits:
+
+| Input | Limit |
+| --- | --- |
+| Table ID | 50 characters |
+| Application profile ID | 50 characters |
+| Column family ID | 64 characters |
+| Row key or read range bound | 4 KiB |
+| Mutations in one request | 100,000 |
+
+Exact read keys must not be empty. Empty range bounds stay valid and mean an
+unbounded side of the range.
+
+Bigtable also recommends keeping qualifiers at or below 16 KiB and cell values
+at or below 10 MiB. The service hard limits are 100 MiB per cell, 256 MiB per
+row, and 200 MiB per mutation. The client does not allocate or copy a large
+value just to validate these size recommendations. Keep bulk requests near the
+default 20 MiB target.
+
+See Google's
+[quotas and limits](https://cloud.google.com/bigtable/quotas) for the current
+service contract.
+
 ## Emulator
 
 Start the official Bigtable emulator:
@@ -572,7 +616,14 @@ cargo fmt --all --check
 cargo check --workspace --all-targets --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features
+cargo test --workspace --all-targets --no-default-features
+cargo test --workspace --all-targets --all-features --release
+cargo test -p bigtable-client --lib --all-features --release \
+  -- --ignored --test-threads=1
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+cargo package -p bigtable-client-derive
+cargo package -p bigtable-client \
+  --config 'patch.crates-io.bigtable-client-derive.path="crates/bigtable-client-derive"'
 ```
 
 The M1 suite covers Google ReadRows chunk semantics, split cells across
@@ -593,6 +644,10 @@ The M4 suite covers span hierarchy, Google-compatible metric names and
 attributes, request event order, retry summaries, deadlines, partial failures,
 cancellation, no-default-feature builds, and live emulator reads and writes.
 
+The M5 suite covers service limit validation, 10,000-row streams, cells split
+across thousands of messages, 10,000-entry partial retry workloads, packaged
+crate builds, and concurrent reads from cloned clients against the emulator.
+
 Every milestone must pass unit, public API, documentation, MSRV, release,
 package, and emulator tests before it is merged.
 
@@ -607,7 +662,7 @@ package, and emulator tests before it is merged.
 - M3 complete: typed row mapping, derive support, custom decoders, and typed
   streams
 - M4 complete: tracing spans, OpenTelemetry metrics, request diagnostics
-- M5: compatibility review, stress tests, docs, and version `0.0.1`
+- M5 complete: compatibility review, stress tests, docs, and version `0.0.1`
 
 No milestone will be published to crates.io.
 
