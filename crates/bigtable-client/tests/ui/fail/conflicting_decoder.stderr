@@ -1,0 +1,5 @@
+error: a field cannot use both #[bigtable(json)] and #[bigtable(with = "...")]
+ --> tests/ui/fail/conflicting_decoder.rs:6:5
+  |
+6 |     #[bigtable(json, with = "decode")]
+  |     ^

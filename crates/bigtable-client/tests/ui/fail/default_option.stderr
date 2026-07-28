@@ -1,0 +1,5 @@
+error: Option fields are already sparse and cannot also use #[bigtable(default)]
+ --> tests/ui/fail/default_option.rs:6:5
+  |
+6 |     #[bigtable(default)]
+  |     ^

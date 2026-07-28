@@ -1,0 +1,11 @@
+error: only one field can use #[bigtable(row_key)]
+ --> tests/ui/fail/duplicate_row_key.rs:7:5
+  |
+7 |     #[bigtable(row_key)]
+  |     ^
+
+error: first row key field is here
+ --> tests/ui/fail/duplicate_row_key.rs:5:5
+  |
+5 |     #[bigtable(row_key)]
+  |     ^

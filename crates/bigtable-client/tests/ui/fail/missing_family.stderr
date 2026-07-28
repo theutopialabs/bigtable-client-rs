@@ -1,0 +1,5 @@
+error: column fields need #[bigtable(family = "...")] on the struct or field
+ --> tests/ui/fail/missing_family.rs:5:5
+  |
+5 |     value: String,
+  |     ^^^^^

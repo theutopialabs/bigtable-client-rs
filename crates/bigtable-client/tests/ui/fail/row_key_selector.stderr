@@ -1,0 +1,5 @@
+error: a row key field cannot select a family or qualifier
+ --> tests/ui/fail/row_key_selector.rs:5:5
+  |
+5 |     #[bigtable(row_key, family = "profile")]
+  |     ^

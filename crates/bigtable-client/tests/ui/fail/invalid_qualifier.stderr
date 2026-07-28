@@ -1,0 +1,5 @@
+error: qualifier must be a string or byte string literal
+ --> tests/ui/fail/invalid_qualifier.rs:6:28
+  |
+6 |     #[bigtable(qualifier = 42)]
+  |                            ^^
