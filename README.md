@@ -54,16 +54,19 @@ bigtable-client = "0.0.1"
 ## Publishing a release
 
 Pushing an exact version tag such as `v0.0.1` starts the publish workflow. The
-workflow accepts only tags whose commit is the current `main` commit and whose
-version exactly matches both workspace crates. It requires the repository's
-Actions secret `CARGO_REGISTRY_TOKEN` with permission to publish the packages.
+workflow accepts only tags whose commit is reachable from `main` and whose
+version exactly matches both workspace crates. A new release must use the current
+`main` commit. It requires the repository's Actions secret `CARGO_REGISTRY_TOKEN`
+with permission to publish the packages.
 
 The workflow runs the release checks and live Bigtable emulator tests on the
 tagged commit, publishes `bigtable-client-derive`, waits for that exact version
 to be indexed by crates.io, and then publishes `bigtable-client`. It rechecks
-`main` immediately before each upload; keep `main` at the tagged commit until
-publication completes. Reruns skip crate versions already published. Create
-release tags only from `main`; the workflow does not create a GitHub Release.
+`main` immediately before publishing the derive crate. Once that exact derive
+version is published, the workflow can finish or resume the release if `main`
+advances. Reruns skip crate versions already published and repeat validation on
+the tagged commit. Create release tags only from `main`; the workflow does not
+create a GitHub Release.
 
 ## Compatibility and support
 

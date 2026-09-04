@@ -36,11 +36,9 @@ jobs:
           set -euo pipefail
 
           tag_commit="$(git rev-parse --verify "${GITHUB_SHA}^{commit}")"
-          main_commit="$(git ls-remote --exit-code origin refs/heads/main | cut -f1)"
-          if [[ "$tag_commit" != "$main_commit" ]]; then
-            echo "The release tag must point to the current main commit." >&2
-            exit 1
-          fi
+          git fetch --no-tags origin refs/heads/main
+          main_commit="$(git rev-parse --verify 'FETCH_HEAD^{commit}')"
+          git merge-base --is-ancestor "$tag_commit" "$main_commit"
 
           metadata="$(cargo metadata --locked --no-deps --format-version=1)"
           client_version="$(jq -er '.packages[] | select(.name == "bigtable-client") | .version' \
@@ -122,6 +120,16 @@ jobs:
           if [[ "$client_published" == "true" && "$derive_published" != "true" ]]; then
             echo "bigtable-client is published but its derive dependency is not; refusing an inconsistent release state." >&2
             exit 1
+          fi
+
+          # A new release starts only from current main. Once derive is published,
+          # allow that release to finish even if main has advanced in the meantime.
+          if [[ "$derive_published" != "true" ]]; then
+            main_commit="$(git ls-remote --exit-code origin refs/heads/main | cut -f1)"
+            if [[ "$(git rev-parse --verify "${GITHUB_SHA}^{commit}")" != "$main_commit" ]]; then
+              echo "A new release tag must point to the current main commit." >&2
+              exit 1
+            fi
           fi
 
       - name: Verify clean checkout
@@ -224,10 +232,5 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Indexing may take several minutes; do not use an earlier main snapshot.
-          main_commit="$(git ls-remote --exit-code origin refs/heads/main | cut -f1)"
-          if [[ "$(git rev-parse --verify "${GITHUB_SHA}^{commit}")" != "$main_commit" ]]; then
-            echo "main changed since release validation; refusing to publish." >&2
-            exit 1
-          fi
+          # Derive publication has started this release; finish it even if main advances.
           cargo publish --locked -p bigtable-client
