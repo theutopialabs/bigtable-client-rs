@@ -445,6 +445,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::result_large_err)]
     fn load_reads_all_environment_values() {
         Jail::expect_with(|jail| {
             jail.set_env("BIGTABLE_PROJECT_ID", "project");
@@ -475,6 +476,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::result_large_err)]
     fn load_reports_parse_errors() {
         Jail::expect_with(|jail| {
             jail.set_env("BIGTABLE_PROJECT_ID", "project");

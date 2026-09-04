@@ -13,10 +13,6 @@ use syn::{
     spanned::Spanned,
 };
 
-mod error;
-
-use error::Result;
-
 /// Derives `bigtable_client::FromRow` for a named struct.
 ///
 /// Set a default family with `#[bigtable(family = "profile")]`. Fields use
@@ -41,7 +37,7 @@ pub fn derive_from_row(input: TokenStream) -> TokenStream {
         .into()
 }
 
-fn expand_from_row(input: &DeriveInput) -> Result<TokenStream2> {
+fn expand_from_row(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let crate_path = client_crate();
     let struct_config = StructConfig::parse(&input.attrs)?;
     let fields = match &input.data {
@@ -114,7 +110,7 @@ fn field_initializer(
     struct_config: &StructConfig,
     crate_path: &TokenStream2,
     generics: &mut Generics,
-) -> Result<TokenStream2> {
+) -> syn::Result<TokenStream2> {
     let ident = field
         .ident
         .as_ref()
@@ -200,7 +196,7 @@ fn validate_row_key_config(
     field: &Field,
     config: &FieldConfig,
     option_inner: Option<&Type>,
-) -> Result<()> {
+) -> syn::Result<()> {
     if config.family.is_some() || config.qualifier.is_some() {
         return Err(syn::Error::new(
             field.span(),
@@ -282,7 +278,7 @@ struct StructConfig {
 }
 
 impl StructConfig {
-    fn parse(attributes: &[Attribute]) -> Result<Self> {
+    fn parse(attributes: &[Attribute]) -> syn::Result<Self> {
         let mut config = Self::default();
         for attribute in attributes
             .iter()
@@ -316,7 +312,7 @@ struct FieldConfig {
 }
 
 impl FieldConfig {
-    fn parse(field: &Field) -> Result<Self> {
+    fn parse(field: &Field) -> syn::Result<Self> {
         let mut config = Self::default();
         for attribute in field
             .attrs
@@ -381,7 +377,7 @@ impl Qualifier {
         }
     }
 
-    fn parse(expression: Expr) -> Result<Self> {
+    fn parse(expression: Expr) -> syn::Result<Self> {
         let span = expression.span();
         match expression {
             Expr::Lit(ExprLit {
@@ -404,7 +400,7 @@ impl Qualifier {
     }
 }
 
-fn set_once<T>(slot: &mut Option<T>, value: T, span: Span, name: &str) -> Result<()> {
+fn set_once<T>(slot: &mut Option<T>, value: T, span: Span, name: &str) -> syn::Result<()> {
     if slot.is_some() {
         return Err(syn::Error::new(
             span,
@@ -415,7 +411,7 @@ fn set_once<T>(slot: &mut Option<T>, value: T, span: Span, name: &str) -> Result
     Ok(())
 }
 
-fn set_flag(slot: &mut bool, span: Span, name: &str) -> Result<()> {
+fn set_flag(slot: &mut bool, span: Span, name: &str) -> syn::Result<()> {
     if *slot {
         return Err(syn::Error::new(
             span,
