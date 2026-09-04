@@ -36,8 +36,11 @@ jobs:
           set -euo pipefail
 
           tag_commit="$(git rev-parse --verify "${GITHUB_SHA}^{commit}")"
-          git rev-parse --verify origin/main^{commit} >/dev/null
-          git merge-base --is-ancestor "$tag_commit" origin/main
+          main_commit="$(git ls-remote --exit-code origin refs/heads/main | cut -f1)"
+          if [[ "$tag_commit" != "$main_commit" ]]; then
+            echo "The release tag must point to the current main commit." >&2
+            exit 1
+          fi
 
           metadata="$(cargo metadata --locked --no-deps --format-version=1)"
           client_version="$(jq -er '.packages[] | select(.name == "bigtable-client") | .version' \
@@ -141,6 +144,31 @@ jobs:
             -- --ignored --test-threads=1
           cargo doc --locked --workspace --all-features --no-deps
 
+      - name: Start emulator
+        run: |
+          docker run --detach --name bigtable-emulator \
+            --publish 127.0.0.1:8086:8086 \
+            gcr.io/google.com/cloudsdktool/google-cloud-cli:574.0.0-emulators \
+            gcloud beta emulators bigtable start --host-port=0.0.0.0:8086
+          for attempt in {1..60}; do
+            if (echo > /dev/tcp/127.0.0.1/8086) 2>/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs bigtable-emulator
+          exit 1
+
+      - name: Test emulator
+        env:
+          BIGTABLE_EMULATOR_HOST: 127.0.0.1:8086
+          RUN_BIGTABLE_EMULATOR_TESTS: "1"
+        run: cargo test --locked --workspace --features emulator-tests --test emulator -- --nocapture
+
+      - name: Show emulator logs
+        if: failure()
+        run: docker logs bigtable-emulator
+
       - name: Package derive crate
         run: cargo package --locked -p bigtable-client-derive
 
@@ -160,7 +188,16 @@ jobs:
         if: steps.registry_state.outputs.derive_published != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --locked -p bigtable-client-derive
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Recheck after validation in case main advanced while tests ran.
+          main_commit="$(git ls-remote --exit-code origin refs/heads/main | cut -f1)"
+          if [[ "$(git rev-parse --verify "${GITHUB_SHA}^{commit}")" != "$main_commit" ]]; then
+            echo "main changed since release validation; refusing to publish." >&2
+            exit 1
+          fi
+          cargo publish --locked -p bigtable-client-derive
 
       - name: Wait for derive crate indexing
         env:
@@ -184,4 +221,13 @@ jobs:
         if: steps.registry_state.outputs.client_published != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --locked -p bigtable-client
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Indexing may take several minutes; do not use an earlier main snapshot.
+          main_commit="$(git ls-remote --exit-code origin refs/heads/main | cut -f1)"
+          if [[ "$(git rev-parse --verify "${GITHUB_SHA}^{commit}")" != "$main_commit" ]]; then
+            echo "main changed since release validation; refusing to publish." >&2
+            exit 1
+          fi
+          cargo publish --locked -p bigtable-client
