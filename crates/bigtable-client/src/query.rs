@@ -6,10 +6,8 @@ use crate::{
         ReadRowsRequest, RowFilter, RowSet,
         row_range::{EndKey, StartKey},
     },
-    resource::{TableIdIssue, table_name, validate_table_id},
+    resource::{MAX_ROW_KEY_BYTES, TableIdIssue, table_name, validate_table_id},
 };
-
-const MAX_ROW_KEY_BYTES: usize = 4 * 1024;
 
 /// One end of a row range.
 #[derive(Clone, Debug, Eq, PartialEq)]

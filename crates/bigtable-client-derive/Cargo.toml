@@ -1,12 +1,14 @@
 [package]
 name = "bigtable-client-derive"
 description = "Derive macros for bigtable-client row mapping"
+readme = "README.md"
+keywords = ["bigtable", "derive", "macro", "gcp", "database"]
+categories = ["database", "development-tools::procedural-macro-helpers"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
 
 [lib]
 proc-macro = true

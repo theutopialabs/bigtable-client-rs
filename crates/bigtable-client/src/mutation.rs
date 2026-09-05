@@ -10,10 +10,9 @@ use crate::{
             DeleteFromColumn, DeleteFromFamily, DeleteFromRow, Mutation as ProtoMutation, SetCell,
         },
     },
-    resource::{TableIdIssue, validate_table_id},
+    resource::{MAX_ROW_KEY_BYTES, TableIdIssue, validate_table_id},
 };
 
-const MAX_ROW_KEY_BYTES: usize = 4 * 1024;
 const MAX_FAMILY_NAME_CHARS: usize = 64;
 const MAX_MUTATIONS_PER_ENTRY: usize = 100_000;
 const MIN_IDEMPOTENCY_TOKEN_BYTES: usize = 8;

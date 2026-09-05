@@ -7,7 +7,8 @@ partial retries, bounded bulk requests, deadline policies, tracing,
 OpenTelemetry metrics, request diagnostics, and direct access to the generated
 Tonic client.
 
-This crate is not published to crates.io.
+The workspace is prepared for crates.io publication. A source checkout alone
+does not establish that any version is available in the registry.
 
 ## Current support
 
@@ -33,7 +34,7 @@ administration are outside the public API.
 
 ## Installation
 
-Depend on the Git repository:
+Until a release is available in crates.io, depend on the Git repository:
 
 ```toml
 [dependencies]
@@ -42,8 +43,30 @@ bigtable-client = { git = "https://github.com/theutopialabs/bigtable-client-rs",
 
 Pin a commit with `rev` when you need reproducible builds.
 
-The current source version is `0.0.1`. The crates are not published, and this
-project does not create release tags yet.
+The current source version is `0.0.1`. When that version has been published,
+use the registry package instead:
+
+```toml
+[dependencies]
+bigtable-client = "0.0.1"
+```
+
+## Publishing a release
+
+Pushing an exact version tag such as `v0.0.1` starts the publish workflow. The
+workflow accepts only tags whose commit is reachable from `main` and whose
+version exactly matches both workspace crates. A new release must use the current
+`main` commit. It requires the repository's Actions secret `CARGO_REGISTRY_TOKEN`
+with permission to publish the packages.
+
+The workflow runs the release checks and live Bigtable emulator tests on the
+tagged commit, publishes `bigtable-client-derive`, waits for that exact version
+to be indexed by crates.io, and then publishes `bigtable-client`. It rechecks
+`main` immediately before publishing the derive crate. Once that exact derive
+version is published, the workflow can finish or resume the release if `main`
+advances. Reruns skip crate versions already published and repeat validation on
+the tagged commit. Create release tags only from `main`; the workflow does not
+create a GitHub Release.
 
 ## Compatibility and support
 
@@ -51,9 +74,9 @@ The minimum supported Rust version is 1.88. CI checks the default feature set,
 `default-features = false`, release builds, rustdoc, packaged crates, and the
 official Bigtable emulator.
 
-Version `0.0.1` is the first supported source release. The API can still change
+Version `0.0.1` is the first release candidate. The API can still change
 between `0.0.x` versions. Pin a Git revision when an application needs a stable
-build.
+source build; crates.io availability remains contingent on an actual release.
 
 The public API covers the Bigtable data service. Use the generated Tonic client
 for data RPCs that do not have a high-level wrapper. Instance, cluster, table,
@@ -664,7 +687,8 @@ package, and emulator tests before it is merged.
 - M4 complete: tracing spans, OpenTelemetry metrics, request diagnostics
 - M5 complete: compatibility review, stress tests, docs, and version `0.0.1`
 
-No milestone will be published to crates.io.
+M5 prepares both packages for crates.io publication. Publishing remains a
+separate release action.
 
 ## License
 

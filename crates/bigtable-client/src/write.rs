@@ -174,8 +174,6 @@ async fn execute_with_service_and_telemetry(
         &options.batch,
     );
     let request_batches = batches.len();
-    let max_in_flight = options.batch.max_in_flight_requests;
-    let app_profile_id = config.app_profile_id().to_owned();
     let mut operation = telemetry.operation(
         config,
         BigtableOperation::MutateRows,
@@ -183,6 +181,98 @@ async fn execute_with_service_and_telemetry(
         total_entries,
     );
     let operation_handle = operation.handle();
+    let (successful_entries, rpc_attempts, mut failures) = run_batches(
+        BatchRunContext {
+            service,
+            app_profile_id: config.app_profile_id(),
+            table_name,
+            routing,
+            options,
+            deadline,
+            operation_handle,
+        },
+        batches,
+    )
+    .await;
+    failures.sort_by_key(MutationFailure::index);
+
+    if failures.is_empty() {
+        operation.finish(
+            Code::Ok,
+            OperationSummary {
+                successful_entries,
+                ..OperationSummary::default()
+            },
+        );
+        Ok(BulkMutationResult {
+            entries: successful_entries,
+            rpc_attempts,
+            request_batches,
+        })
+    } else {
+        operation.finish(
+            mutation_failures_code(&failures),
+            OperationSummary {
+                successful_entries,
+                failed_entries: failures.len(),
+                ..OperationSummary::default()
+            },
+        );
+        Err(BulkMutationError {
+            total_entries,
+            successful_entries,
+            rpc_attempts,
+            failures,
+        }
+        .into())
+    }
+}
+
+struct BatchRunContext<'a> {
+    service: Arc<dyn MutateRowsService>,
+    app_profile_id: &'a str,
+    table_name: String,
+    routing: MetadataValue<Ascii>,
+    options: BulkMutationOptions,
+    deadline: Instant,
+    operation_handle: OperationHandle,
+}
+
+async fn run_batches(
+    context: BatchRunContext<'_>,
+    mut batches: Vec<Vec<PendingEntry>>,
+) -> (usize, u32, Vec<MutationFailure>) {
+    if batches.len() == 1 {
+        let outcome = BatchOperation {
+            service: context.service,
+            table_name: context.table_name,
+            app_profile_id: context.app_profile_id.to_owned(),
+            routing: context.routing,
+            options: context.options,
+            deadline: context.deadline,
+            pending: batches.pop().expect("a nonempty mutation has one batch"),
+            successful: 0,
+            failures: Vec::new(),
+            rpc_attempts: 0,
+            batch: 0,
+            telemetry: context.operation_handle,
+        }
+        .run()
+        .await;
+        return (outcome.successful, outcome.rpc_attempts, outcome.failures);
+    }
+
+    let BatchRunContext {
+        service,
+        app_profile_id,
+        table_name,
+        routing,
+        options,
+        deadline,
+        operation_handle,
+    } = context;
+    let max_in_flight = options.batch.max_in_flight_requests;
+    let app_profile_id = app_profile_id.to_owned();
     let outcomes = stream::iter(batches.into_iter().enumerate())
         .map(|(batch, entries)| {
             let service = Arc::clone(&service);
@@ -222,38 +312,7 @@ async fn execute_with_service_and_telemetry(
         rpc_attempts = rpc_attempts.saturating_add(outcome.rpc_attempts);
         failures.extend(outcome.failures);
     }
-    failures.sort_by_key(MutationFailure::index);
-
-    if failures.is_empty() {
-        operation.finish(
-            Code::Ok,
-            OperationSummary {
-                successful_entries,
-                ..OperationSummary::default()
-            },
-        );
-        Ok(BulkMutationResult {
-            entries: successful_entries,
-            rpc_attempts,
-            request_batches,
-        })
-    } else {
-        operation.finish(
-            mutation_failures_code(&failures),
-            OperationSummary {
-                successful_entries,
-                failed_entries: failures.len(),
-                ..OperationSummary::default()
-            },
-        );
-        Err(BulkMutationError {
-            total_entries,
-            successful_entries,
-            rpc_attempts,
-            failures,
-        }
-        .into())
-    }
+    (successful_entries, rpc_attempts, failures)
 }
 
 #[cfg(test)]
@@ -523,7 +582,9 @@ impl BatchOperation {
         attempt_deadline: Instant,
         telemetry: &mut crate::telemetry::AttemptTracker,
     ) -> AttemptOutcome {
-        let mut results = (0..current.len()).map(|_| None).collect::<Vec<_>>();
+        let mut seen = vec![false; current.len()];
+        let mut seen_count = 0;
+        let mut entry_failures = Vec::new();
         let mut stream_failure = None;
         let mut protocol_issue = None;
 
@@ -541,19 +602,23 @@ impl BatchOperation {
                             });
                             break;
                         };
-                        if index >= results.len() {
+                        if index >= current.len() {
                             protocol_issue = Some(MutateRowsResponseIssue::IndexOutOfRange {
                                 index: result.index,
-                                entry_count: results.len(),
+                                entry_count: current.len(),
                             });
                             break;
                         }
-                        if results[index].is_some() {
+                        if seen[index] {
                             protocol_issue =
                                 Some(MutateRowsResponseIssue::DuplicateIndex { index });
                             break;
                         }
-                        results[index] = Some(status_result(result.status));
+                        seen[index] = true;
+                        seen_count += 1;
+                        if let Err(status) = status_result(result.status) {
+                            entry_failures.push((index, status));
+                        }
                     }
                     if protocol_issue.is_some() {
                         break;
@@ -574,53 +639,66 @@ impl BatchOperation {
         }
 
         if let Some(issue) = protocol_issue {
+            return Self::invalid_response_outcome(current, &issue);
+        }
+
+        if seen_count == current.len() && entry_failures.is_empty() {
             return AttemptOutcome {
-                code: Code::Unknown,
-                successful: 0,
-                failures: current
-                    .into_iter()
-                    .map(|entry| MutationFailure {
-                        index: entry.original_index,
-                        attempts: entry.attempts,
-                        cause: MutationFailureCause::InvalidResponse {
-                            issue: issue.clone(),
-                        },
-                    })
-                    .collect(),
-                retry: Vec::new(),
-                retry_delay: Duration::ZERO,
+                successful: current.len(),
+                ..AttemptOutcome::default()
             };
         }
 
+        entry_failures.sort_unstable_by_key(|(index, _)| *index);
         let mut outcome = AttemptOutcome::default();
-        for (local_index, (entry, result)) in current.into_iter().zip(results).enumerate() {
-            match result {
-                Some(Ok(())) => outcome.successful += 1,
-                Some(Err(entry_status)) => {
+        let mut entry_failures = entry_failures.into_iter().peekable();
+        for (local_index, entry) in current.into_iter().enumerate() {
+            if seen[local_index] {
+                if matches!(entry_failures.peek(), Some((index, _)) if *index == local_index) {
+                    let Some((_, entry_status)) = entry_failures.next() else {
+                        unreachable!("the peeked entry failure must be present");
+                    };
                     self.classify_status(entry, entry_status, FailureOrigin::Entry, &mut outcome);
+                } else {
+                    outcome.successful += 1;
                 }
-                None => {
-                    if let Some(status) = &stream_failure {
-                        self.classify_status(
-                            entry,
-                            status.clone(),
-                            FailureOrigin::Rpc,
-                            &mut outcome,
-                        );
-                    } else {
-                        outcome.code = Code::Unknown;
-                        outcome.failures.push(MutationFailure {
-                            index: entry.original_index,
-                            attempts: entry.attempts,
-                            cause: MutationFailureCause::InvalidResponse {
-                                issue: MutateRowsResponseIssue::MissingIndex { index: local_index },
-                            },
-                        });
-                    }
-                }
+            } else if let Some(status) = &stream_failure {
+                self.classify_status(entry, status.clone(), FailureOrigin::Rpc, &mut outcome);
+            } else {
+                outcome.code = Code::Unknown;
+                outcome.failures.push(MutationFailure {
+                    index: entry.original_index,
+                    attempts: entry.attempts,
+                    cause: MutationFailureCause::InvalidResponse {
+                        issue: MutateRowsResponseIssue::MissingIndex { index: local_index },
+                    },
+                });
             }
         }
+        debug_assert!(entry_failures.next().is_none());
         outcome
+    }
+
+    fn invalid_response_outcome(
+        current: Vec<PendingEntry>,
+        issue: &MutateRowsResponseIssue,
+    ) -> AttemptOutcome {
+        AttemptOutcome {
+            code: Code::Unknown,
+            successful: 0,
+            failures: current
+                .into_iter()
+                .map(|entry| MutationFailure {
+                    index: entry.original_index,
+                    attempts: entry.attempts,
+                    cause: MutationFailureCause::InvalidResponse {
+                        issue: issue.clone(),
+                    },
+                })
+                .collect(),
+            retry: Vec::new(),
+            retry_delay: Duration::ZERO,
+        }
     }
 
     fn rpc_failure(&self, current: Vec<PendingEntry>, status: &Status) -> AttemptOutcome {
@@ -1017,6 +1095,65 @@ mod tests {
         ));
     }
 
+    fn assert_success_diagnostics(
+        events: &[DiagnosticEvent],
+        entries: usize,
+        entries_per_batch: usize,
+        batches: usize,
+    ) {
+        assert_eq!(events.len(), 2 + (3 * batches));
+        assert!(matches!(
+            events[0],
+            DiagnosticEvent::OperationStarted {
+                entries: actual_entries,
+                ..
+            } if actual_entries == entries
+        ));
+        for batch in 0..batches {
+            let offset = 1 + (3 * batch);
+            assert!(matches!(
+                events[offset],
+                DiagnosticEvent::AttemptStarted {
+                    batch: Some(actual_batch),
+                    attempt: 1,
+                    entries: actual_entries,
+                    ..
+                } if actual_batch == batch && actual_entries == entries_per_batch
+            ));
+            assert!(matches!(
+                events[offset + 1],
+                DiagnosticEvent::FirstResponse {
+                    batch: Some(actual_batch),
+                    attempt: 1,
+                    ..
+                } if actual_batch == batch
+            ));
+            assert!(matches!(
+                events[offset + 2],
+                DiagnosticEvent::AttemptFinished {
+                    batch: Some(actual_batch),
+                    attempt: 1,
+                    code: Code::Ok,
+                    successful_entries: actual_successful_entries,
+                    failed_entries: 0,
+                    ..
+                } if actual_batch == batch && actual_successful_entries == entries_per_batch
+            ));
+        }
+        assert!(matches!(
+            events.last(),
+            Some(DiagnosticEvent::OperationFinished {
+                code: Code::Ok,
+                attempts: actual_attempts,
+                retries: 0,
+                successful_entries: actual_successful_entries,
+                failed_entries: 0,
+                ..
+            }) if *actual_attempts == u32::try_from(batches).expect("small batch count")
+                && *actual_successful_entries == entries
+        ));
+    }
+
     #[test]
     fn defaults_match_google_bulk_write_guidance() {
         let options = BulkMutationOptions::default();
@@ -1111,6 +1248,76 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn all_success_stream_completes_without_a_retry() {
+        let service = Arc::new(FakeService::new([Script::Stream(vec![
+            Ok(response([
+                (3, Some(rpc_status(Code::Ok, ""))),
+                (1, Some(rpc_status(Code::Ok, ""))),
+            ])),
+            Ok(response([(0, None), (2, Some(rpc_status(Code::Ok, "")))])),
+        ])]));
+        let result = execute_with_service(
+            service.clone(),
+            &config(),
+            bulk([
+                safe_row(b"a".to_vec()),
+                safe_row(b"b".to_vec()),
+                safe_row(b"c".to_vec()),
+                safe_row(b"d".to_vec()),
+            ]),
+            options(),
+        )
+        .await
+        .expect("all entries succeed");
+
+        assert_eq!(result.entries(), 4);
+        assert_eq!(result.rpc_attempts(), 1);
+        assert_eq!(service.requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn single_batch_keeps_result_and_telemetry_accounting() {
+        let service = Arc::new(FakeService::new([Script::SuccessAll]));
+        let (telemetry, events) = recorded_telemetry();
+        let result = execute_with_service_and_telemetry(
+            service,
+            &config(),
+            telemetry,
+            bulk((0..100).map(|index| safe_row(format!("single-{index}").into_bytes()))),
+            options(),
+        )
+        .await
+        .expect("the default 100-entry batch succeeds");
+
+        assert_eq!(result.entries(), 100);
+        assert_eq!(result.rpc_attempts(), 1);
+        assert_eq!(result.request_batches(), 1);
+        assert_success_diagnostics(&events.lock().expect("diagnostics lock"), 100, 100, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn multiple_batches_keep_result_and_telemetry_accounting() {
+        let service = Arc::new(FakeService::new([Script::SuccessAll, Script::SuccessAll]));
+        let (telemetry, events) = recorded_telemetry();
+        let mut batch_options = options();
+        batch_options.batch.max_entries_per_request = 1;
+        let result = execute_with_service_and_telemetry(
+            service,
+            &config(),
+            telemetry,
+            bulk([safe_row(b"a".to_vec()), safe_row(b"b".to_vec())]),
+            batch_options,
+        )
+        .await
+        .expect("multiple batches succeed");
+
+        assert_eq!(result.entries(), 2);
+        assert_eq!(result.rpc_attempts(), 2);
+        assert_eq!(result.request_batches(), 2);
+        assert_success_diagnostics(&events.lock().expect("diagnostics lock"), 2, 1, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn partial_retry_sends_only_transient_entries_and_keeps_original_indexes() {
         let service = Arc::new(FakeService::new([
             Script::Stream(vec![Ok(response([
@@ -1156,6 +1363,46 @@ mod tests {
 
         let events = events.lock().expect("diagnostics lock");
         assert_partial_retry_diagnostics(&events);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sparse_entry_failures_are_classified_by_original_index() {
+        let service = Arc::new(FakeService::new([
+            Script::Stream(vec![Ok(response([
+                (4, Some(rpc_status(Code::InvalidArgument, "bad mutation"))),
+                (2, Some(rpc_status(Code::Unavailable, "retry"))),
+                (0, Some(rpc_status(Code::Ok, ""))),
+                (3, Some(rpc_status(Code::Ok, ""))),
+                (1, Some(rpc_status(Code::Ok, ""))),
+            ]))]),
+            Script::SuccessAll,
+        ]));
+        let error = execute_with_service(
+            service.clone(),
+            &config(),
+            bulk([
+                safe_row(b"a".to_vec()),
+                safe_row(b"b".to_vec()),
+                safe_row(b"c".to_vec()),
+                safe_row(b"d".to_vec()),
+                safe_row(b"e".to_vec()),
+            ]),
+            options(),
+        )
+        .await
+        .expect_err("one permanent failure");
+        let Error::BulkMutation(error) = error else {
+            panic!("grouped mutation error");
+        };
+
+        assert_eq!(error.successful_entries(), 4);
+        assert_eq!(error.rpc_attempts(), 2);
+        assert_eq!(error.failures().len(), 1);
+        assert_eq!(error.failures()[0].index(), 4);
+        assert_eq!(error.failures()[0].attempts(), 1);
+        let requests = service.requests.lock().await;
+        assert_eq!(requests[1].message.entries.len(), 1);
+        assert_eq!(requests[1].message.entries[0].row_key.as_ref(), b"c");
     }
 
     #[tokio::test(start_paused = true)]

@@ -1,6 +1,7 @@
 use crate::ClientConfig;
 
-pub(crate) const MAX_TABLE_ID_CHARS: usize = 50;
+const MAX_TABLE_ID_CHARS: usize = 50;
+pub(crate) const MAX_ROW_KEY_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TableIdIssue {

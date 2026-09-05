@@ -12,7 +12,7 @@ use tonic::metadata::{Ascii, MetadataValue};
 
 use crate::Error;
 
-pub(crate) const BIGTABLE_DATA_SCOPE: &str = "https://www.googleapis.com/auth/bigtable.data";
+const BIGTABLE_DATA_SCOPE: &str = "https://www.googleapis.com/auth/bigtable.data";
 const REFRESH_MARGIN: Duration = Duration::from_secs(15);
 const REFRESH_RETRY_DELAY: Duration = Duration::from_secs(5);
 

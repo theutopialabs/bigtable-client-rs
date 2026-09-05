@@ -1,0 +1,236 @@
+name: Publish crates
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+  RUSTDOCFLAGS: -Dwarnings
+
+jobs:
+  publish:
+    name: Validate and publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: clippy,rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify release source and version
+        id: release_metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag_commit="$(git rev-parse --verify "${GITHUB_SHA}^{commit}")"
+          git fetch --no-tags origin refs/heads/main
+          main_commit="$(git rev-parse --verify 'FETCH_HEAD^{commit}')"
+          git merge-base --is-ancestor "$tag_commit" "$main_commit"
+
+          metadata="$(cargo metadata --locked --no-deps --format-version=1)"
+          client_version="$(jq -er '.packages[] | select(.name == "bigtable-client") | .version' \
+            <<<"$metadata")"
+          derive_version="$(jq -er '.packages[] | select(.name == "bigtable-client-derive") | .version' \
+            <<<"$metadata")"
+
+          if [[ "$client_version" != "$derive_version" ]]; then
+            echo "The workspace crate versions must match." >&2
+            exit 1
+          fi
+
+          if [[ "${GITHUB_REF_NAME}" != "v${client_version}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} must exactly match v${client_version}." >&2
+            exit 1
+          fi
+
+          echo "derive_version=$derive_version" >> "$GITHUB_OUTPUT"
+          echo "client_version=$client_version" >> "$GITHUB_OUTPUT"
+
+      - name: Check crates.io release state
+        id: registry_state
+        env:
+          CLIENT_VERSION: ${{ steps.release_metadata.outputs.client_version }}
+          DERIVE_VERSION: ${{ steps.release_metadata.outputs.derive_version }}
+          CRATES_IO_USER_AGENT: bigtable-client-rs-release-workflow/1.0 (+https://github.com/theutopialabs/bigtable-client-rs)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_state() {
+            local crate_name="$1"
+            local crate_version="$2"
+            local response_file
+            local http_status
+
+            response_file="$(mktemp)"
+            http_status="$(curl --silent --show-error --output "$response_file" \
+              --write-out '%{http_code}' --connect-timeout 10 --max-time 30 \
+              --user-agent "$CRATES_IO_USER_AGENT" \
+              "https://crates.io/api/v1/crates/${crate_name}/${crate_version}")" \
+              || {
+                rm -f "$response_file"
+                echo "Unable to determine whether ${crate_name} ${crate_version} exists on crates.io." >&2
+                exit 1
+              }
+
+            case "$http_status" in
+              200)
+                if ! jq -e --arg crate "$crate_name" --arg version "$crate_version" \
+                  '.version.crate == $crate and .version.num == $version' \
+                  "$response_file" >/dev/null; then
+                  rm -f "$response_file"
+                  echo "crates.io returned an unexpected record for ${crate_name} ${crate_version}." >&2
+                  exit 1
+                fi
+                printf '%s' true
+                ;;
+              404)
+                printf '%s' false
+                ;;
+              *)
+                cat "$response_file" >&2
+                rm -f "$response_file"
+                echo "crates.io returned HTTP ${http_status} while checking ${crate_name} ${crate_version}." >&2
+                exit 1
+                ;;
+            esac
+
+            rm -f "$response_file"
+          }
+
+          derive_published="$(release_state bigtable-client-derive "$DERIVE_VERSION")"
+          client_published="$(release_state bigtable-client "$CLIENT_VERSION")"
+
+          echo "derive_published=$derive_published" >> "$GITHUB_OUTPUT"
+          echo "client_published=$client_published" >> "$GITHUB_OUTPUT"
+
+          if [[ "$client_published" == "true" && "$derive_published" != "true" ]]; then
+            echo "bigtable-client is published but its derive dependency is not; refusing an inconsistent release state." >&2
+            exit 1
+          fi
+
+          # A new release starts only from current main. Once derive is published,
+          # allow that release to finish even if main has advanced in the meantime.
+          if [[ "$derive_published" != "true" ]]; then
+            main_commit="$(git ls-remote --exit-code origin refs/heads/main | cut -f1)"
+            if [[ "$(git rev-parse --verify "${GITHUB_SHA}^{commit}")" != "$main_commit" ]]; then
+              echo "A new release tag must point to the current main commit." >&2
+              exit 1
+            fi
+          fi
+
+      - name: Verify clean checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+
+      - name: Run quality checks
+        run: |
+          cargo fmt --all --check
+          cargo check --locked --workspace --all-targets --all-features
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+          cargo test --locked --workspace --all-targets --all-features
+          cargo test --locked --workspace --doc --all-features
+          cargo check --locked --workspace --all-targets --no-default-features
+          cargo test --locked --workspace --all-targets --no-default-features
+          cargo test --locked --workspace --all-targets --all-features --release
+          cargo test --locked -p bigtable-client --lib --all-features --release \
+            -- --ignored --test-threads=1
+          cargo doc --locked --workspace --all-features --no-deps
+
+      - name: Start emulator
+        run: |
+          docker run --detach --name bigtable-emulator \
+            --publish 127.0.0.1:8086:8086 \
+            gcr.io/google.com/cloudsdktool/google-cloud-cli:574.0.0-emulators \
+            gcloud beta emulators bigtable start --host-port=0.0.0.0:8086
+          for attempt in {1..60}; do
+            if (echo > /dev/tcp/127.0.0.1/8086) 2>/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs bigtable-emulator
+          exit 1
+
+      - name: Test emulator
+        env:
+          BIGTABLE_EMULATOR_HOST: 127.0.0.1:8086
+          RUN_BIGTABLE_EMULATOR_TESTS: "1"
+        run: cargo test --locked --workspace --features emulator-tests --test emulator -- --nocapture
+
+      - name: Show emulator logs
+        if: failure()
+        run: docker logs bigtable-emulator
+
+      - name: Package derive crate
+        run: cargo package --locked -p bigtable-client-derive
+
+      - name: Package client crate
+        run: >-
+          cargo package --locked -p bigtable-client
+          --config
+          'patch.crates-io.bigtable-client-derive.path="crates/bigtable-client-derive"'
+
+      - name: Verify clean release tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+
+      - name: Publish derive crate
+        if: steps.registry_state.outputs.derive_published != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Recheck after validation in case main advanced while tests ran.
+          main_commit="$(git ls-remote --exit-code origin refs/heads/main | cut -f1)"
+          if [[ "$(git rev-parse --verify "${GITHUB_SHA}^{commit}")" != "$main_commit" ]]; then
+            echo "main changed since release validation; refusing to publish." >&2
+            exit 1
+          fi
+          cargo publish --locked -p bigtable-client-derive
+
+      - name: Wait for derive crate indexing
+        env:
+          CRATE_NAME: bigtable-client-derive
+          CRATE_VERSION: ${{ steps.release_metadata.outputs.derive_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for attempt in {1..60}; do
+            if cargo info --locked --registry crates-io "${CRATE_NAME}@${CRATE_VERSION}" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo "${CRATE_NAME} ${CRATE_VERSION} was not indexed within 10 minutes; the client was not published." >&2
+          exit 1
+
+      - name: Publish client crate
+        if: steps.registry_state.outputs.client_published != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Derive publication has started this release; finish it even if main advances.
+          cargo publish --locked -p bigtable-client

@@ -32,7 +32,7 @@ pub enum BigtableOperation {
 
 impl BigtableOperation {
     #[must_use]
-    pub(crate) const fn method(self) -> &'static str {
+    const fn method(self) -> &'static str {
         match self {
             Self::ReadRows => "ReadRows",
             Self::MutateRows => "MutateRows",
@@ -41,7 +41,7 @@ impl BigtableOperation {
 
     #[cfg(feature = "opentelemetry")]
     #[must_use]
-    pub(crate) const fn is_streaming(self) -> bool {
+    const fn is_streaming(self) -> bool {
         match self {
             Self::ReadRows | Self::MutateRows => true,
         }
@@ -675,7 +675,7 @@ impl MetricContext {
     }
 }
 
-pub(crate) const fn grpc_code_name(code: Code) -> &'static str {
+const fn grpc_code_name(code: Code) -> &'static str {
     match code {
         Code::Ok => "OK",
         Code::Cancelled => "CANCELLED",
