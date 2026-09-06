@@ -48,7 +48,7 @@ fn build_endpoint(config: &ClientConfig) -> Result<Endpoint, Error> {
         .keep_alive_while_idle(true)
         .tcp_nodelay(true);
 
-    if !config.uses_emulator() {
+    if endpoint.uri().scheme_str() == Some("https") {
         endpoint = endpoint
             .tls_config(ClientTlsConfig::new().with_webpki_roots())
             .map_err(|source| Error::Transport {
@@ -62,6 +62,8 @@ fn build_endpoint(config: &ClientConfig) -> Result<Endpoint, Error> {
 #[cfg(test)]
 mod tests {
     use std::{net::TcpListener, time::Duration};
+
+    use tokio::io::AsyncReadExt;
 
     use super::{build_endpoint, connect};
     use crate::{ClientConfig, Error};
@@ -92,6 +94,35 @@ mod tests {
         let endpoint = build_endpoint(&config).expect("valid TLS endpoint");
 
         assert_eq!(endpoint.uri().to_string(), "https://example.test/");
+    }
+
+    #[tokio::test]
+    async fn https_emulator_starts_a_tls_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("available local port");
+        let address = listener.local_addr().expect("bound address");
+        let config = ClientConfig::new("project", "instance")
+            .expect("valid config")
+            .with_emulator_host(format!("https://{address}"))
+            .expect("valid emulator")
+            .with_connect_timeout(Duration::from_secs(2))
+            .expect("valid timeout");
+
+        let observe_handshake = async {
+            let (mut socket, _) = listener.accept().await.expect("client connects");
+            let mut prefix = [0; 3];
+            socket.read_exact(&mut prefix).await.expect("TLS record");
+            // TLS handshake record and legacy record version in a ClientHello.
+            assert_eq!(prefix, [0x16, 0x03, 0x01]);
+        };
+        let (result, observed) = tokio::join!(
+            connect(&config),
+            tokio::time::timeout(Duration::from_secs(2), observe_handshake),
+        );
+
+        observed.expect("handshake observed before timeout");
+        assert!(result.is_err(), "test peer closes without completing TLS");
     }
 
     #[tokio::test]

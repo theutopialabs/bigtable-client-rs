@@ -787,6 +787,8 @@ pub enum ConfigIssue {
     },
     /// The value is not a valid absolute HTTP or HTTPS URI.
     InvalidUri,
+    /// An authenticated production endpoint does not use HTTPS.
+    HttpsRequired,
     /// The number must be greater than zero.
     MustBePositive,
 }
@@ -799,6 +801,7 @@ impl fmt::Display for ConfigIssue {
                 write!(formatter, "must not exceed {max_chars} characters")
             }
             Self::InvalidUri => formatter.write_str("must be an absolute HTTP or HTTPS URI"),
+            Self::HttpsRequired => formatter.write_str("must use HTTPS for authenticated requests"),
             Self::MustBePositive => formatter.write_str("must be greater than zero"),
         }
     }

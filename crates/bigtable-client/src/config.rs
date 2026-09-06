@@ -91,7 +91,7 @@ impl ClientConfig {
     /// # Errors
     ///
     /// Returns [`Error::InvalidConfig`] when the endpoint is not an absolute
-    /// HTTP or HTTPS URI.
+    /// HTTPS URI.
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Result<Self, Error> {
         self.endpoint = valid_uri(&endpoint.into(), ConfigField::Endpoint)?;
         Ok(self)
@@ -347,6 +347,9 @@ fn valid_uri(value: &str, field: ConfigField) -> Result<String, Error> {
     if !valid_scheme || uri.authority().is_none() || !valid_path || uri.query().is_some() {
         return Err(Error::invalid_config(field, ConfigIssue::InvalidUri));
     }
+    if field == ConfigField::Endpoint && uri.scheme_str() != Some("https") {
+        return Err(Error::invalid_config(field, ConfigIssue::HttpsRequired));
+    }
     Ok(value)
 }
 
@@ -442,6 +445,32 @@ mod tests {
             .expect("valid emulator");
 
         assert_eq!(config.emulator_host(), Some("https://localhost:8086"));
+    }
+
+    #[test]
+    fn production_endpoint_rejects_plaintext_transport() {
+        let result = ClientConfig::new("project", "instance")
+            .expect("valid config")
+            .with_endpoint("http://localhost:8086");
+
+        assert_invalid(&result, ConfigField::Endpoint, ConfigIssue::HttpsRequired);
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn load_rejects_plaintext_production_endpoint() {
+        Jail::expect_with(|jail| {
+            jail.set_env("BIGTABLE_PROJECT_ID", "project");
+            jail.set_env("BIGTABLE_INSTANCE_ID", "instance");
+            jail.set_env("BIGTABLE_ENDPOINT", "http://localhost:8086");
+
+            assert_invalid(
+                &ClientConfig::load(),
+                ConfigField::Endpoint,
+                ConfigIssue::HttpsRequired,
+            );
+            Ok(())
+        });
     }
 
     #[test]
