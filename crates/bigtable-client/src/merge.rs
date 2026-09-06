@@ -1,9 +1,14 @@
+use std::collections::HashMap;
+
 use bytes::{Bytes, BytesMut};
 
 use crate::{
     Cell, Column, Family, Row, RowMergeIssue,
     proto::read_rows_response::{CellChunk, cell_chunk::RowStatus},
 };
+
+// Small families avoid a hash allocation; wide rows avoid quadratic lookup.
+const INDEXED_COLUMN_THRESHOLD: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
@@ -17,6 +22,7 @@ pub(crate) struct RowMerger {
     state: State,
     last_complete_key: Option<Bytes>,
     row: Row,
+    column_indices: Vec<Option<HashMap<Bytes, usize>>>,
     family: String,
     qualifier: Bytes,
     timestamp_micros: i64,
@@ -33,6 +39,7 @@ impl RowMerger {
             state: State::NewRow,
             last_complete_key: None,
             row: empty_row(),
+            column_indices: Vec::new(),
             family: String::new(),
             qualifier: Bytes::new(),
             timestamp_micros: 0,
@@ -213,12 +220,23 @@ impl RowMerger {
             value: std::mem::take(&mut self.value).freeze(),
             labels: std::mem::take(&mut self.labels),
         };
-        if let Some(family) = self
+        let Some(family_index) = self
             .row
             .families
-            .iter_mut()
-            .find(|family| family.name == self.family)
-        {
+            .iter()
+            .position(|family| family.name == self.family)
+        else {
+            self.row.families.push(Family {
+                name: self.family.clone(),
+                columns: vec![Column {
+                    qualifier: self.qualifier.clone(),
+                    cells: vec![cell],
+                }],
+            });
+            return;
+        };
+        let family = &mut self.row.families[family_index];
+        if family.columns.len() < INDEXED_COLUMN_THRESHOLD {
             if let Some(column) = family
                 .columns
                 .iter_mut()
@@ -231,19 +249,32 @@ impl RowMerger {
                     cells: vec![cell],
                 });
             }
-        } else {
-            self.row.families.push(Family {
-                name: self.family.clone(),
-                columns: vec![Column {
-                    qualifier: self.qualifier.clone(),
-                    cells: vec![cell],
-                }],
-            });
+            return;
         }
+        if self.column_indices.len() <= family_index {
+            self.column_indices.resize_with(family_index + 1, || None);
+        }
+        let indices = self.column_indices[family_index].get_or_insert_with(|| {
+            family
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(index, column)| (column.qualifier.clone(), index))
+                .collect()
+        });
+        let column_index = *indices.entry(self.qualifier.clone()).or_insert_with(|| {
+            family.columns.push(Column {
+                qualifier: self.qualifier.clone(),
+                cells: Vec::new(),
+            });
+            family.columns.len() - 1
+        });
+        family.columns[column_index].cells.push(cell);
     }
 
     fn commit_row(&mut self) -> Row {
         let row = std::mem::replace(&mut self.row, empty_row());
+        self.column_indices.clear();
         self.last_complete_key = Some(row.key.clone());
         self.clear_cell();
         self.state = State::NewRow;
@@ -283,6 +314,7 @@ impl RowMerger {
 
     fn clear_active_row(&mut self) {
         self.row = empty_row();
+        self.column_indices.clear();
         self.family.clear();
         self.qualifier = Bytes::new();
         self.clear_cell();
@@ -334,6 +366,116 @@ mod tests {
             value_size,
             row_status: status,
         }
+    }
+
+    fn push_wide_family(
+        merger: &mut RowMerger,
+        row_key: &'static [u8],
+        family: &str,
+        reversed: bool,
+    ) {
+        for index in 0..=super::INDEXED_COLUMN_THRESHOLD {
+            let qualifier = if reversed {
+                super::INDEXED_COLUMN_THRESHOLD - index
+            } else {
+                index
+            };
+            let mut next = chunk(
+                if index == 0 { row_key } else { b"" },
+                (index == 0).then_some(family),
+                None,
+                2,
+                b"first",
+                0,
+                None,
+            );
+            next.qualifier = Some(format!("q-{qualifier:03}").into_bytes());
+            assert!(merger.push(&next).expect("wide column").is_none());
+        }
+    }
+
+    #[test]
+    fn wide_rows_preserve_encounter_order_across_families_and_commits() {
+        let mut merger = RowMerger::new(false);
+        for (key, reversed) in [(b"row-1".as_slice(), true), (b"row-2".as_slice(), false)] {
+            push_wide_family(&mut merger, key, "f", reversed);
+            push_wide_family(&mut merger, b"", "g", reversed);
+            let row = merger
+                .push(&chunk(
+                    b"",
+                    Some("f"),
+                    Some(b"q-005"),
+                    1,
+                    b"again",
+                    0,
+                    Some(RowStatus::CommitRow(true)),
+                ))
+                .expect("revisited column")
+                .expect("complete row");
+            assert_eq!(row.families.len(), 2);
+            assert_eq!(row.families[0].name, "f");
+            assert_eq!(row.families[1].name, "g");
+            for family in &row.families {
+                assert_eq!(family.columns.len(), super::INDEXED_COLUMN_THRESHOLD + 1);
+                for (index, column) in family.columns.iter().enumerate() {
+                    let qualifier = if reversed {
+                        super::INDEXED_COLUMN_THRESHOLD - index
+                    } else {
+                        index
+                    };
+                    assert_eq!(
+                        column.qualifier.as_ref(),
+                        format!("q-{qualifier:03}").as_bytes()
+                    );
+                    let expected = if family.name == "f" && qualifier == 5 {
+                        2
+                    } else {
+                        1
+                    };
+                    assert_eq!(column.cells.len(), expected);
+                    if expected == 2 {
+                        assert_eq!(column.cells[1].value.as_ref(), b"again");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reset_discards_wide_row_column_indices() {
+        let mut merger = RowMerger::new(false);
+        push_wide_family(&mut merger, b"row", "f", true);
+        merger
+            .push(&chunk(
+                b"",
+                None,
+                None,
+                0,
+                b"",
+                0,
+                Some(RowStatus::ResetRow(true)),
+            ))
+            .expect("reset");
+        push_wide_family(&mut merger, b"row", "f", false);
+        let row = merger
+            .push(&chunk(
+                b"",
+                None,
+                Some(b"q-005"),
+                1,
+                b"again",
+                0,
+                Some(RowStatus::CommitRow(true)),
+            ))
+            .expect("revisited column")
+            .expect("complete row");
+        assert_eq!(
+            row.families[0].columns.len(),
+            super::INDEXED_COLUMN_THRESHOLD + 1
+        );
+        assert_eq!(row.families[0].columns[5].qualifier.as_ref(), b"q-005");
+        assert_eq!(row.families[0].columns[5].cells.len(), 2);
+        assert_eq!(row.families[0].columns[5].cells[1].value.as_ref(), b"again");
     }
 
     #[test]
