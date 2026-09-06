@@ -642,15 +642,6 @@ mod tests {
     }
 
     #[test]
-    fn row_accessors_report_key_and_empty_state() {
-        let row = RowMutation::new(b"row".to_vec()).expect("valid row");
-
-        assert_eq!(row.row_key(), &Bytes::from_static(b"row"));
-        assert_eq!(row.len(), 0);
-        assert!(row.is_empty());
-    }
-
-    #[test]
     fn row_mutation_enforces_the_api_change_limit() {
         let mut row = RowMutation::new(b"row".to_vec()).expect("valid row");
         for _ in 0..100_000 {

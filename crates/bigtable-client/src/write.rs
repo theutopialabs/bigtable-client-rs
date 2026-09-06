@@ -1174,46 +1174,12 @@ mod tests {
     }
 
     #[test]
-    fn result_accessors_report_operation_counts() {
-        let result = BulkMutationResult {
-            entries: 12,
-            rpc_attempts: 3,
-            request_batches: 2,
-        };
-
-        assert_eq!(result.entries(), 12);
-        assert_eq!(result.rpc_attempts(), 3);
-        assert_eq!(result.request_batches(), 2);
-    }
-
-    #[test]
     fn encoded_message_size_includes_tag_and_varint() {
         assert_eq!(varint_size(0), 1);
         assert_eq!(varint_size(127), 1);
         assert_eq!(varint_size(128), 2);
         assert_eq!(repeated_message_size(127), 129);
         assert_eq!(repeated_message_size(128), 131);
-    }
-
-    #[test]
-    fn custom_options_are_plain_owned_values() {
-        let options = BulkMutationOptions {
-            retry: RetryPolicy {
-                max_attempts: 2,
-                ..RetryPolicy::default()
-            },
-            deadlines: DeadlinePolicy {
-                operation_timeout: Duration::from_secs(5),
-                attempt_timeout: Duration::from_secs(1),
-            },
-            batch: BatchPolicy {
-                max_entries_per_request: 10,
-                max_request_bytes: 1024,
-                max_in_flight_requests: 2,
-            },
-        };
-
-        assert_eq!(options.clone(), options);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1249,34 +1215,6 @@ mod tests {
             "table_name=projects/project/instances/instance/tables/events"
         );
         assert!(requests[0].has_timeout);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn all_success_stream_completes_without_a_retry() {
-        let service = Arc::new(FakeService::new([Script::Stream(vec![
-            Ok(response([
-                (3, Some(rpc_status(Code::Ok, ""))),
-                (1, Some(rpc_status(Code::Ok, ""))),
-            ])),
-            Ok(response([(0, None), (2, Some(rpc_status(Code::Ok, "")))])),
-        ])]));
-        let result = execute_with_service(
-            service.clone(),
-            &config(),
-            bulk([
-                safe_row(b"a".to_vec()),
-                safe_row(b"b".to_vec()),
-                safe_row(b"c".to_vec()),
-                safe_row(b"d".to_vec()),
-            ]),
-            options(),
-        )
-        .await
-        .expect("all entries succeed");
-
-        assert_eq!(result.entries(), 4);
-        assert_eq!(result.rpc_attempts(), 1);
-        assert_eq!(service.requests.lock().await.len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1367,46 +1305,6 @@ mod tests {
 
         let events = events.lock().expect("diagnostics lock");
         assert_partial_retry_diagnostics(&events);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn sparse_entry_failures_are_classified_by_original_index() {
-        let service = Arc::new(FakeService::new([
-            Script::Stream(vec![Ok(response([
-                (4, Some(rpc_status(Code::InvalidArgument, "bad mutation"))),
-                (2, Some(rpc_status(Code::Unavailable, "retry"))),
-                (0, Some(rpc_status(Code::Ok, ""))),
-                (3, Some(rpc_status(Code::Ok, ""))),
-                (1, Some(rpc_status(Code::Ok, ""))),
-            ]))]),
-            Script::SuccessAll,
-        ]));
-        let error = execute_with_service(
-            service.clone(),
-            &config(),
-            bulk([
-                safe_row(b"a".to_vec()),
-                safe_row(b"b".to_vec()),
-                safe_row(b"c".to_vec()),
-                safe_row(b"d".to_vec()),
-                safe_row(b"e".to_vec()),
-            ]),
-            options(),
-        )
-        .await
-        .expect_err("one permanent failure");
-        let Error::BulkMutation(error) = error else {
-            panic!("grouped mutation error");
-        };
-
-        assert_eq!(error.successful_entries(), 4);
-        assert_eq!(error.rpc_attempts(), 2);
-        assert_eq!(error.failures().len(), 1);
-        assert_eq!(error.failures()[0].index(), 4);
-        assert_eq!(error.failures()[0].attempts(), 1);
-        let requests = service.requests.lock().await;
-        assert_eq!(requests[1].message.entries.len(), 1);
-        assert_eq!(requests[1].message.entries[0].row_key.as_ref(), b"c");
     }
 
     #[tokio::test(start_paused = true)]

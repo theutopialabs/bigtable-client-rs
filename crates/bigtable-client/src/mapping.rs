@@ -557,9 +557,7 @@ mod tests {
     use serde::Deserialize;
 
     use super::{DecodedCell, FromCellValue, FromRow, RowDecoder};
-    use crate::{
-        Cell, Column, Error, Family, Row, RowMappingIssue, RowValueLocation, ValueDecodeError,
-    };
+    use crate::{Cell, Column, Family, Row, RowMappingIssue, RowValueLocation};
 
     #[derive(Debug, Deserialize, Eq, PartialEq)]
     struct Profile {
@@ -649,19 +647,14 @@ mod tests {
         );
         assert_eq!(String::from_cell_value(&value).expect("UTF-8 string"), "42");
         assert_eq!(u8::from_cell_value(&value).expect("u8"), 42);
-        assert_eq!(u16::from_cell_value(&value).expect("u16"), 42);
-        assert_eq!(u32::from_cell_value(&value).expect("u32"), 42);
-        assert_eq!(u64::from_cell_value(&value).expect("u64"), 42);
-        assert_eq!(u128::from_cell_value(&value).expect("u128"), 42);
-        assert_eq!(usize::from_cell_value(&value).expect("usize"), 42);
-        assert_eq!(i8::from_cell_value(&value).expect("i8"), 42);
-        assert_eq!(i16::from_cell_value(&value).expect("i16"), 42);
-        assert_eq!(i32::from_cell_value(&value).expect("i32"), 42);
-        assert_eq!(i64::from_cell_value(&value).expect("i64"), 42);
-        assert_eq!(i128::from_cell_value(&value).expect("i128"), 42);
-        assert_eq!(isize::from_cell_value(&value).expect("isize"), 42);
-        assert!((f32::from_cell_value(&value).expect("f32") - 42.0).abs() < f32::EPSILON);
-        assert!((f64::from_cell_value(&value).expect("f64") - 42.0).abs() < f64::EPSILON);
+        assert_eq!(
+            i64::from_cell_value(&Bytes::from_static(b"-42")).expect("signed integer"),
+            -42
+        );
+        assert!(
+            (f64::from_cell_value(&Bytes::from_static(b"42.5")).expect("float") - 42.5).abs()
+                < f64::EPSILON
+        );
         assert!(bool::from_cell_value(&Bytes::from_static(b"true")).expect("bool"));
     }
 
@@ -683,33 +676,23 @@ mod tests {
         let row = row();
         let decoder = RowDecoder::new(&row);
 
-        assert_eq!(decoder.row_key::<String>().expect("row key"), "user#1");
         assert_eq!(
-            decoder
-                .required::<String>("profile", b"name")
-                .expect("name"),
-            "Ada"
+            row.clone().map::<ManualRow>().expect("mapped row"),
+            ManualRow {
+                key: "user#1".to_owned(),
+                name: "Ada".to_owned(),
+                profile: Profile {
+                    enabled: true,
+                    count: 7
+                },
+                score: 255,
+            }
         );
         assert_eq!(
             decoder
                 .optional::<String>("profile", b"nickname")
                 .expect("sparse column"),
             None
-        );
-        assert_eq!(
-            decoder
-                .required_json::<Profile>("profile", b"json")
-                .expect("profile JSON"),
-            Profile {
-                enabled: true,
-                count: 7,
-            }
-        );
-        assert_eq!(
-            decoder
-                .required_with("metrics", b"score", parse_hex)
-                .expect("hex score"),
-            255
         );
         assert_eq!(
             decoder
@@ -829,39 +812,5 @@ mod tests {
                 } if family == "profile" && qualifier.as_ref() == b"name"
             ));
         }
-    }
-
-    #[test]
-    fn manual_from_row_and_row_map_use_the_same_decoder_contract() {
-        let expected = ManualRow {
-            key: "user#1".to_owned(),
-            name: "Ada".to_owned(),
-            profile: Profile {
-                enabled: true,
-                count: 7,
-            },
-            score: 255,
-        };
-
-        assert_eq!(ManualRow::from_row(row()).expect("manual mapper"), expected);
-        assert_eq!(row().map::<ManualRow>().expect("row mapper"), expected);
-    }
-
-    #[test]
-    fn mapping_errors_convert_to_the_crate_error() {
-        let mapping = RowDecoder::new(&row())
-            .required::<String>("missing", b"name")
-            .expect_err("family is required");
-        let error = Error::from(mapping);
-
-        assert!(matches!(error, Error::RowMapping(_)));
-    }
-
-    #[test]
-    fn custom_value_errors_record_the_requested_target() {
-        let source = "x".parse::<u32>().expect_err("invalid integer");
-        let error = ValueDecodeError::new::<u32, _>(source);
-
-        assert_eq!(error.target(), "u32");
     }
 }

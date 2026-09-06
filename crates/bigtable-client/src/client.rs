@@ -612,10 +612,13 @@ mod tests {
 
     #[test]
     fn interceptor_debug_contains_no_credentials() {
-        let interceptor = AuthInterceptor::new(None).expect("valid static metadata");
+        let tokens =
+            TokenManager::from_static("very-secret", SystemTime::now() + Duration::from_secs(60))
+                .expect("valid token");
+        let interceptor = AuthInterceptor::new(Some(tokens)).expect("valid static metadata");
         let debug = format!("{interceptor:?}");
 
-        assert!(debug.contains("authenticated: false"));
-        assert!(!debug.contains("Bearer"));
+        assert!(debug.contains("authenticated: true"));
+        assert!(!debug.contains("very-secret"));
     }
 }

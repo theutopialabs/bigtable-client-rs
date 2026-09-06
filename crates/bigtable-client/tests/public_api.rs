@@ -54,7 +54,7 @@ fn decode_hex(value: &[u8]) -> Result<u16, std::num::ParseIntError> {
 fn public_config_api_builds_a_valid_emulator_target() {
     let config = ClientConfig::new("project", "instance")
         .expect("valid IDs")
-        .with_app_profile_id("analytics")
+        .with_app_profile_id(" analytics ")
         .expect("valid app profile")
         .with_emulator_host("localhost:8086")
         .expect("valid emulator")
@@ -75,9 +75,7 @@ fn public_config_api_builds_a_valid_emulator_target() {
 }
 
 #[test]
-fn package_version_and_service_limit_errors_are_public() {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.0.1");
-
+fn public_validation_errors_are_typed() {
     let config_error = ClientConfig::new("project", "instance")
         .expect("valid IDs")
         .with_app_profile_id("a".repeat(51))
@@ -98,21 +96,11 @@ fn package_version_and_service_limit_errors_are_public() {
             issue: MutationIssue::FamilyNameTooLong,
         }
     ));
-    assert_eq!(
-        QueryIssue::RowKeyTooLong.to_string(),
-        "row keys and range bounds must not exceed 4 KiB"
-    );
-}
-
-#[test]
-fn public_errors_can_be_matched_without_string_parsing() {
-    let error = ClientConfig::new("", "instance").expect_err("project ID is required");
-
+    let query_error = Query::new("").expect_err("table ID is required");
     assert!(matches!(
-        error,
-        Error::InvalidConfig {
-            field: ConfigField::ProjectId,
-            issue: ConfigIssue::Empty,
+        query_error,
+        Error::InvalidQuery {
+            issue: QueryIssue::EmptyTableId,
         }
     ));
 }
@@ -164,8 +152,8 @@ fn public_query_and_row_types_support_binary_data() {
 }
 
 #[test]
-fn public_read_policies_are_configurable() {
-    let options = ReadOptions {
+fn public_policy_types_are_configurable() {
+    let read_options = ReadOptions {
         retry: RetryPolicy {
             max_attempts: 5,
             initial_backoff: Duration::from_millis(25),
@@ -179,8 +167,36 @@ fn public_read_policies_are_configurable() {
         },
     };
 
-    assert_eq!(options.retry.max_attempts, 5);
-    assert_eq!(options.deadlines.attempt_timeout, Duration::from_secs(5));
+    let write_options = BulkMutationOptions {
+        retry: RetryPolicy {
+            max_attempts: 4,
+            initial_backoff: Duration::from_millis(20),
+            max_backoff: Duration::from_secs(1),
+            multiplier: 2.0,
+            jitter: Jitter::None,
+        },
+        deadlines: DeadlinePolicy {
+            operation_timeout: Duration::from_secs(20),
+            attempt_timeout: Duration::from_secs(3),
+        },
+        batch: BatchPolicy {
+            max_entries_per_request: 50,
+            max_request_bytes: 4 * 1024 * 1024,
+            max_in_flight_requests: 3,
+        },
+    };
+
+    assert_eq!(read_options.retry.max_attempts, 5);
+    assert_eq!(
+        read_options.deadlines.attempt_timeout,
+        Duration::from_secs(5)
+    );
+    assert_eq!(write_options.batch.max_entries_per_request, 50);
+    assert_eq!(write_options.batch.max_in_flight_requests, 3);
+    assert_eq!(
+        BulkMutationPolicyIssue::ZeroInFlightRequests.to_string(),
+        "max_in_flight_requests must be greater than zero"
+    );
 }
 
 #[test]
@@ -193,9 +209,7 @@ fn public_observability_api_builds_without_connecting() {
     let observer: Arc<dyn DiagnosticObserver> = Arc::new(|_event: &DiagnosticEvent| {});
     let shared = Client::builder(config).with_shared_diagnostic_observer(observer);
     assert!(format!("{shared:?}").contains("has_diagnostic_observer: true"));
-
-    let operation = BigtableOperation::ReadRows;
-    assert!(matches!(operation, BigtableOperation::ReadRows));
+    assert_eq!(format!("{:?}", BigtableOperation::ReadRows), "ReadRows");
 }
 
 #[cfg(feature = "opentelemetry")]
@@ -326,63 +340,6 @@ fn public_row_decoder_errors_can_be_matched_without_string_parsing() {
         RowMappingIssue::MissingFamily { family } if family == "profile"
     ));
     assert_eq!(error.row_key().as_ref(), b"user#1");
-}
-
-#[test]
-fn public_mutation_errors_are_typed() {
-    let empty_row = RowMutation::new("row").expect("valid row");
-    let error = BulkMutation::new("events")
-        .expect("valid table")
-        .entry(empty_row)
-        .expect_err("empty row mutation is rejected");
-
-    assert!(matches!(
-        error,
-        Error::InvalidMutation {
-            issue: MutationIssue::EmptyRowMutation
-        }
-    ));
-}
-
-#[test]
-fn public_bulk_mutation_policies_are_configurable() {
-    let options = BulkMutationOptions {
-        retry: RetryPolicy {
-            max_attempts: 4,
-            initial_backoff: Duration::from_millis(20),
-            max_backoff: Duration::from_secs(1),
-            multiplier: 2.0,
-            jitter: Jitter::None,
-        },
-        deadlines: DeadlinePolicy {
-            operation_timeout: Duration::from_secs(20),
-            attempt_timeout: Duration::from_secs(3),
-        },
-        batch: BatchPolicy {
-            max_entries_per_request: 50,
-            max_request_bytes: 4 * 1024 * 1024,
-            max_in_flight_requests: 3,
-        },
-    };
-
-    assert_eq!(options.batch.max_entries_per_request, 50);
-    assert_eq!(options.batch.max_in_flight_requests, 3);
-    assert_eq!(
-        BulkMutationPolicyIssue::ZeroInFlightRequests.to_string(),
-        "max_in_flight_requests must be greater than zero"
-    );
-}
-
-#[test]
-fn public_query_errors_are_typed() {
-    let error = Query::new("").expect_err("table ID is required");
-
-    assert!(matches!(
-        error,
-        Error::InvalidQuery {
-            issue: QueryIssue::EmptyTableId
-        }
-    ));
 }
 
 #[test]

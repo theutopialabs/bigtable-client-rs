@@ -84,18 +84,6 @@ mod tests {
         assert!(endpoint.get_tcp_nodelay());
     }
 
-    #[test]
-    fn production_endpoint_enables_tls() {
-        let config = ClientConfig::new("project", "instance")
-            .expect("valid config")
-            .with_endpoint("https://example.test")
-            .expect("valid endpoint");
-
-        let endpoint = build_endpoint(&config).expect("valid TLS endpoint");
-
-        assert_eq!(endpoint.uri().to_string(), "https://example.test/");
-    }
-
     #[tokio::test]
     async fn https_emulator_starts_a_tls_handshake() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

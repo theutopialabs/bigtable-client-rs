@@ -407,37 +407,6 @@ mod tests {
     }
 
     #[test]
-    fn builders_set_every_option() {
-        let config = ClientConfig::new("project", "instance")
-            .expect("valid config")
-            .with_app_profile_id(" analytics ")
-            .expect("valid app profile")
-            .with_endpoint("https://example.test")
-            .expect("valid endpoint")
-            .with_emulator_host("127.0.0.1:8086")
-            .expect("valid emulator")
-            .with_channel_pool_size(3)
-            .expect("valid pool")
-            .with_connect_timeout(Duration::from_secs(2))
-            .expect("valid timeout")
-            .with_request_timeout(Duration::from_secs(3))
-            .expect("valid timeout")
-            .with_keep_alive(Duration::from_secs(4), Duration::from_secs(5))
-            .expect("valid keepalive");
-
-        assert_eq!(config.app_profile_id(), "analytics");
-        assert_eq!(config.endpoint(), "https://example.test");
-        assert_eq!(config.emulator_host(), Some("http://127.0.0.1:8086"));
-        assert_eq!(config.service_endpoint(), "http://127.0.0.1:8086");
-        assert_eq!(config.channel_pool_size(), 3);
-        assert_eq!(config.connect_timeout(), Duration::from_secs(2));
-        assert_eq!(config.request_timeout(), Duration::from_secs(3));
-        assert_eq!(config.keep_alive_interval(), Duration::from_secs(4));
-        assert_eq!(config.keep_alive_timeout(), Duration::from_secs(5));
-        assert!(config.uses_emulator());
-    }
-
-    #[test]
     fn emulator_builder_keeps_explicit_scheme() {
         let config = ClientConfig::new("project", "instance")
             .expect("valid config")

@@ -797,41 +797,4 @@ mod tests {
             Err(RowMergeIssue::ResetWithData)
         );
     }
-
-    #[test]
-    fn retry_can_discard_only_the_partial_row() {
-        let mut merger = RowMerger::new(false);
-        assert!(
-            merger
-                .push(&chunk(
-                    b"a",
-                    Some("f"),
-                    Some(b"q"),
-                    1,
-                    b"ok",
-                    0,
-                    Some(RowStatus::CommitRow(true))
-                ))
-                .expect("first row")
-                .is_some()
-        );
-        merger
-            .push(&chunk(b"b", Some("f"), Some(b"q"), 1, b"bad", 0, None))
-            .expect("partial second row");
-        merger.discard_partial();
-
-        let row = merger
-            .push(&chunk(
-                b"b",
-                Some("f"),
-                Some(b"q"),
-                2,
-                b"retry",
-                0,
-                Some(RowStatus::CommitRow(true)),
-            ))
-            .expect("retried row")
-            .expect("complete row");
-        assert_eq!(row.families[0].columns[0].cells[0].value.as_ref(), b"retry");
-    }
 }

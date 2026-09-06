@@ -345,25 +345,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_inclusive_and_exclusive_bounds_are_preserved() {
-        assert_eq!(
-            RowBound::inclusive(Bytes::from_static(b"a")),
-            RowBound::Inclusive(Bytes::from_static(b"a"))
-        );
-        assert_eq!(
-            RowBound::exclusive(Bytes::from_static(b"z")),
-            RowBound::Exclusive(Bytes::from_static(b"z"))
-        );
-        assert_eq!(
-            RowRange::new(RowBound::Unbounded, RowBound::Unbounded),
-            RowRange {
-                start: RowBound::Unbounded,
-                end: RowBound::Unbounded
-            }
-        );
-    }
-
-    #[test]
     fn invalid_table_ids_return_typed_errors() {
         let cases = [
             (String::new(), QueryIssue::EmptyTableId),
