@@ -19,13 +19,14 @@ may change when that produces a simpler, correct contract.
 | P2 | Deadline and malformed-response [mutation failures](../crates/bigtable-client/src/error.rs) lose known replay safety. | Move idempotency onto the failed entry, independently of its cause. Safe/unsafe write and failure-path regressions pass. | Fixed: `4859ed0` |
 | P2 | Extreme accepted [retry durations](../crates/bigtable-client/src/retry.rs) panic during floating-point conversion. | Saturate at the configured maximum; exercise duration/multiplier overflow. | Fixed: `8923271` |
 | P2 | [Retry diagnostics](../crates/bigtable-client/src/telemetry.rs) count retries cancelled before the RPC starts. | Count retries when an attempt starts. Cancellation and actual retry-event tests pass. | Fixed: `5b59511` |
-| P2 | [Token refresh](../crates/bigtable-client/src/auth.rs) can rapidly poll near-expiry tokens or sleep past a cached token's expiry; its task handle has an unnecessary mutex. | Refresh short-lived tokens partway through their TTL; cap successful cached-token retries at remaining validity, with a five-second fallback after expiry/errors. Tests reproduced both rapid polling and the validity gap before the fixes. | Fixed: `d10472a`, `9fba697`, cached-token follow-up |
+| P2 | [Token refresh](../crates/bigtable-client/src/auth.rs) can rapidly poll near-expiry tokens or sleep past a cached token's expiry; its task handle has an unnecessary mutex. | Refresh short-lived tokens partway through their TTL; cap successful cached-token retries at remaining validity, with a five-second fallback after expiry/errors. Tests reproduced both rapid polling and the validity gap before the fixes. | Fixed: `d10472a`, `9fba697`, `6724f3e` |
 | P2 | [Wide-row assembly](../crates/bigtable-client/src/merge.rs) repeatedly searches every existing column. | Lazily index families with 16 or more columns; keep the ordered public row model and narrow-row lookup. Tests cover interleaving, versions, commit, and reset. | Fixed: `b9585a1` |
 | P2 | [README](../README.md) repeats milestone history and omits some locked development checks. | Keep workflows, limits, release requirements, and one validation recipe; correct buffering, TLS, and failure-safety descriptions. | Fixed |
 
-Plans are checked with the thirdeye skill before implementation. Completed
-changes receive autoreview against the actual diff, callers, failure paths,
-and relevant regression tests before being committed.
+Plans were checked with the thirdeye skill before implementation. Changes
+received autoreview against the actual diff, callers, failure paths, and
+regression tests before being committed. Independent review caught the attempt
+deadline and cached-token validity gaps; both were corrected and reverified.
 
 ## Investigation notes
 
@@ -63,18 +64,33 @@ not network throughput or production latency claims. Source snapshots, the
 reproduction script, and raw CSV results are retained for this local session
 in `/tmp/bigtable-merger-audit/` (`python3 reproduce.py`).
 
-## Validation
+## Final validation
 
-- Initial all-feature baseline: 135 unit tests, 16 public API tests, and the
-  derive compiler suite passed; four serial instrumentation/stress tests were
-  intentionally excluded from that run.
-- The live local emulator baseline passed separately with its required opt-in.
-- Rust 1.88.0 all-target/all-feature compilation passed. The shell overrides
-  the repository toolchain with Rust 1.97.1, so subsequent release checks use
-  `cargo +1.88.0` explicitly.
-- Final feature, compiler, documentation, release, packaging, and emulator
-  verification will be recorded after the changes are integrated.
-- `cargo audit` is not installed; no vulnerability-audit result is claimed.
+All checks below passed on source commit `12feb9f`, using Rust 1.88.0 explicitly
+because the shell overrides the repository toolchain with Rust 1.97.1. The
+subsequent commit updates only this audit record. The full matrix was rerun
+after the final authentication correction; the working tree was clean during
+packaging.
+
+| Check | Result |
+| --- | --- |
+| Formatting, all-target compilation, Clippy | Passed with warnings denied; all-feature and no-default-feature compilation covered. |
+| All-feature debug tests | 149 unit tests, 16 public API tests, derive compiler fixtures, and the real gRPC transport regression passed. |
+| No-default-feature tests | 148 unit tests, 15 public API tests, derive compiler fixtures, and transport regression passed. |
+| Release tests | Same all-feature test suite passed with optimization. |
+| Serial instrumentation/stress tests | All four normally ignored tests passed separately: large streams, split cells, partial bulk retries, and span hierarchy. |
+| Rustdoc | Three doctests passed with each feature configuration; documentation built with warnings denied. |
+| README examples | All 11 examples passed Rustdoc verification against the built client. |
+| Packages | Both crates packaged and their extracted packages compiled with `--locked`; client validation used the local derive patch from CI. |
+| Live local emulator | Raw/high-level reads, writes, deletes, typed mapping, observability, and concurrent reads passed with the opt-in enabled. |
+| Cleanup and diff | The task's emulator container was removed and its absence verified. `git diff --check` passed. |
+
+The commands match the README development recipe, with `cargo +1.88.0`,
+`RUSTFLAGS=-Dwarnings`, and `RUSTDOCFLAGS=-Dwarnings`. Logs, the sequential
+validation script, and its JSON results are retained for this local session in
+`/tmp/bigtable-release-cleanup-validation/`.
+
+`cargo audit` is not installed; no vulnerability-database scan is claimed.
 
 Local emulator checks establish emulator behavior, not production Bigtable
 behavior. This audit does not publish crates, push commits, create tags, or
