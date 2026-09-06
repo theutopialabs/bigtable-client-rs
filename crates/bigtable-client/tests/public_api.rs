@@ -35,6 +35,7 @@ struct UserRecord {
     score: u16,
     #[bigtable(family = "binary", qualifier = b"\xff")]
     payload: Bytes,
+    r#type: String,
 }
 
 #[derive(Debug, Eq, PartialEq, bigtable_client::FromRow)]
@@ -259,6 +260,7 @@ fn public_derive_maps_sparse_json_custom_and_binary_fields() {
                     column(b"name", b"Ada"),
                     column(b"is_active", b"true"),
                     column(b"settings", br#"{"theme":"dark"}"#),
+                    column(b"type", b"person"),
                 ],
             },
             Family {
@@ -285,6 +287,7 @@ fn public_derive_maps_sparse_json_custom_and_binary_fields() {
             },
             score: 255,
             payload: Bytes::from_static(b"\x00\xff"),
+            r#type: "person".to_owned(),
         }
     );
 }

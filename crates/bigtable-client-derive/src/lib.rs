@@ -9,7 +9,7 @@ use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
 use syn::{
     Attribute, Data, DeriveInput, Expr, ExprLit, Field, Fields, GenericArgument, Generics, Lit,
-    LitByteStr, LitStr, Path, PathArguments, Type, parse_macro_input, parse_quote,
+    LitByteStr, LitStr, Path, PathArguments, Type, ext::IdentExt, parse_macro_input, parse_quote,
     spanned::Spanned,
 };
 
@@ -137,7 +137,7 @@ fn field_initializer(
     let qualifier = config
         .qualifier
         .clone()
-        .unwrap_or_else(|| Qualifier::new(ident.to_string().as_bytes(), ident.span()));
+        .unwrap_or_else(|| Qualifier::new(ident.unraw().to_string().as_bytes(), ident.span()));
     let qualifier = qualifier.literal();
 
     if option_inner.is_some() && config.default {
@@ -246,10 +246,23 @@ fn option_inner(field_type: &Type) -> Option<&Type> {
     let Type::Path(type_path) = field_type else {
         return None;
     };
-    let segment = type_path.path.segments.last()?;
-    if segment.ident != "Option" {
+    if type_path.qself.is_some() {
         return None;
     }
+    let segments = &type_path.path.segments;
+    let is_option = match segments.len() {
+        1 => segments[0].ident == "Option",
+        3 => {
+            (segments[0].ident == "std" || segments[0].ident == "core")
+                && segments[1].ident == "option"
+                && segments[2].ident == "Option"
+        }
+        _ => false,
+    };
+    if !is_option {
+        return None;
+    }
+    let segment = segments.last()?;
     let PathArguments::AngleBracketed(arguments) = &segment.arguments else {
         return None;
     };
