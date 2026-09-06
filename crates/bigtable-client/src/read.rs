@@ -40,7 +40,7 @@ type ResponseStream =
     Pin<Box<dyn Stream<Item = Result<ReadRowsResponse, Status>> + Send + 'static>>;
 
 /// A stream of complete Bigtable rows.
-#[must_use = "row streams do nothing unless they are consumed"]
+#[must_use = "dropping the row stream cancels the read"]
 pub struct RowStream {
     inner: ReceiverStream<Result<Row, Error>>,
 }
@@ -247,12 +247,13 @@ impl ReadOperation {
                 Ok(Some(Ok(response))) => {
                     active.telemetry.first_response();
                     let before = self.rows_returned;
-                    match self.handle_response(response, &sender).await {
+                    let result = self.handle_response(response, &sender).await;
+                    active.rows = active.rows.saturating_add(
+                        u64::try_from(self.rows_returned.saturating_sub(before))
+                            .unwrap_or(u64::MAX),
+                    );
+                    match result {
                         Ok(true) => {
-                            active.rows = active.rows.saturating_add(
-                                u64::try_from(self.rows_returned.saturating_sub(before))
-                                    .unwrap_or(u64::MAX),
-                            );
                             if self.limit_reached() {
                                 active.finish(Code::Ok);
                                 self.finish(Code::Ok);
@@ -265,8 +266,14 @@ impl ReadOperation {
                             return;
                         }
                         Err(error) => {
-                            active.finish(Code::Unknown);
-                            self.finish(Code::Unknown);
+                            let code = if matches!(error, Error::ReadDeadlineExceeded { .. }) {
+                                Code::DeadlineExceeded
+                            } else {
+                                Code::Unknown
+                            };
+                            active.finish(code);
+                            self.finish(code);
+                            drop(active);
                             send_terminal(&sender, error).await;
                             return;
                         }
@@ -274,6 +281,7 @@ impl ReadOperation {
                 }
                 Ok(None) => {
                     active.finish(Code::Ok);
+                    drop(active);
                     if let Err(issue) = self.merger.finish() {
                         self.finish(Code::Unknown);
                         send_terminal(&sender, Error::InvalidReadRowsResponse { issue }).await;
@@ -284,6 +292,7 @@ impl ReadOperation {
                 }
                 Ok(Some(Err(status))) => {
                     active.finish(status.code());
+                    drop(active);
                     self.merger.discard_partial();
                     match self.open(Some(status), Some(&sender)).await {
                         Ok(OpenResult::Active(next_attempt)) => active = next_attempt,
@@ -296,6 +305,7 @@ impl ReadOperation {
                 }
                 Err(_) => {
                     active.finish(Code::DeadlineExceeded);
+                    drop(active);
                     self.merger.discard_partial();
                     let status = Status::deadline_exceeded("ReadRows attempt deadline exceeded");
                     match self.open(Some(status), Some(&sender)).await {
@@ -324,19 +334,23 @@ impl ReadOperation {
         }
 
         for chunk in response.chunks {
+            if Instant::now() >= self.deadline {
+                return Err(self.deadline_error());
+            }
             if let Some(row) = self
                 .merger
                 .push(&chunk)
                 .map_err(|issue| Error::InvalidReadRowsResponse { issue })?
             {
-                self.rows_returned += 1;
-                self.progress = Some(row.key.clone());
+                let key = row.key.clone();
                 let blocked = Instant::now();
-                let sent = sender.send(Ok(row)).await;
+                let sent = timeout_at(self.deadline, sender.send(Ok(row))).await;
                 self.telemetry().application_blocked(blocked.elapsed());
-                if sent.is_err() {
+                if sent.map_err(|_| self.deadline_error())?.is_err() {
                     return Ok(false);
                 }
+                self.rows_returned += 1;
+                self.progress = Some(key);
             }
         }
         Ok(true)
@@ -606,6 +620,7 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use futures_core::Stream;
+    use futures_util::StreamExt as _;
     use tokio::sync::Mutex;
     use tonic::{Code, Request, Status};
 
@@ -629,6 +644,7 @@ mod tests {
         Stream(Vec<Result<ReadRowsResponse, Status>>),
         Pending,
         PendingDrop(Arc<AtomicBool>),
+        BufferedDrop(Vec<Result<ReadRowsResponse, Status>>, Arc<AtomicBool>),
     }
 
     #[derive(Default)]
@@ -664,6 +680,9 @@ mod tests {
                 Script::Stream(items) => Ok(Box::pin(tokio_stream::iter(items))),
                 Script::Pending => Ok(Box::pin(futures_util::stream::pending())),
                 Script::PendingDrop(dropped) => Ok(Box::pin(PendingDrop { dropped })),
+                Script::BufferedDrop(items, dropped) => Ok(Box::pin(
+                    tokio_stream::iter(items).chain(PendingDrop { dropped }),
+                )),
             }
         }
     }
@@ -1071,6 +1090,61 @@ mod tests {
             requests[1].rows.as_ref().expect("resumed rows").row_ranges[0].start_key,
             Some(StartKey::StartKeyOpen(Bytes::from_static(b"m")))
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn operation_deadline_releases_rpc_while_row_buffer_is_full() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let items = (0..=super::STREAM_BUFFER)
+            .map(|index| {
+                Ok(owned_row_response(
+                    Bytes::from(format!("row-{index:03}")),
+                    Bytes::new(),
+                ))
+            })
+            .collect();
+        let service = Arc::new(FakeService::new([Script::BufferedDrop(
+            items,
+            dropped.clone(),
+        )]));
+        let (telemetry, events) = recorded_telemetry();
+        let mut stream = start_with_service_and_telemetry(
+            service,
+            &config(),
+            telemetry,
+            Query::new("table").expect("query"),
+            options(),
+        )
+        .await
+        .expect("read starts");
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "deadline must release the active RPC without receiver progress"
+        );
+        for _ in 0..super::STREAM_BUFFER {
+            stream
+                .next()
+                .await
+                .expect("buffered row")
+                .expect("complete row");
+        }
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(Error::ReadDeadlineExceeded { .. }))
+        ));
+        assert!(stream.next().await.is_none());
+        let events = events.lock().expect("events");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DiagnosticEvent::OperationFinished {
+                code: Code::DeadlineExceeded,
+                rows: 16,
+                ..
+            }
+        )));
     }
 
     #[tokio::test(start_paused = true)]
