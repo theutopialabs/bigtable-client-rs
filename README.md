@@ -1,6 +1,6 @@
 # Bigtable client for Rust
 
-An async, production-focused Rust client for Google Cloud Bigtable.
+An async Rust client for Google Cloud Bigtable.
 
 Version `0.0.1` provides high-level reads and writes, typed row mapping, safe
 partial retries, bounded bulk requests, deadline policies, tracing,
@@ -9,28 +9,6 @@ Tonic client.
 
 The workspace is prepared for crates.io publication. A source checkout alone
 does not establish that any version is available in the registry.
-
-## Current support
-
-| Capability | Status | Milestone |
-| --- | --- | --- |
-| Native Tonic gRPC | Available | M0 |
-| Application default credentials | Available | M0 |
-| Channel pooling | Available | M0 |
-| Emulator integration tests | Available | M0 |
-| High-level row query API | Available | M1 |
-| Stateful streamed row assembly | Available | M1 |
-| Retry and deadline policies | Available | M1 |
-| Single-row and bulk mutations | Available | M2 |
-| Bounded bulk flow control | Available | M2 |
-| Partial mutation retries | Available | M2 |
-| Typed row mapping and derive | Available | M3 |
-| Tracing and OpenTelemetry | Available | M4 |
-| Request diagnostics | Available | M4 |
-| Production hardening and `0.0.1` | Available | M5 |
-
-The client currently covers the Bigtable data API. Instance, cluster, and table
-administration are outside the public API.
 
 ## Installation
 
@@ -157,7 +135,8 @@ Row
 ```
 
 Families, columns, and cells stay in server response order. Cell timestamps are
-in microseconds. Filter labels are kept on each cell.
+in microseconds. Filter labels are kept on each cell. The client accepts gRPC
+response messages up to 256 MiB.
 
 ## Retries and deadlines
 
@@ -213,8 +192,12 @@ while let Some(row) = rows.next().await {
 # }
 ```
 
-Dropping `RowStream` cancels its background read task once the next row is
-ready to send.
+Reads start before the returned `RowStream` is consumed and buffer up to 16
+rows. Dropping the stream cancels the background read, including an idle RPC
+or retry backoff. The operation deadline also applies while the application
+is not consuming rows. Buffered rows remain available before the terminal
+deadline error. If an attempt times out first, a retry resumes after the last
+row successfully buffered.
 
 ## Typed rows
 
@@ -394,7 +377,10 @@ match client.mutate_rows(bulk).await {
     Ok(result) => println!("wrote {} rows", result.entries()),
     Err(Error::BulkMutation(error)) => {
         for failure in error.failures() {
-            eprintln!("entry {} failed: {}", failure.index(), failure.cause());
+            eprintln!(
+                "entry {} failed (replay safe: {}): {}",
+                failure.index(), failure.retry_safe(), failure.cause(),
+            );
         }
     }
     Err(error) => return Err(error),
@@ -402,6 +388,10 @@ match client.mutate_rows(bulk).await {
 # Ok(())
 # }
 ```
+
+`MutationFailure::retry_safe` reports the entry's idempotency for every failure
+cause, including deadlines and malformed responses. It does not mean the
+underlying error is transient or that an automatic retry will succeed.
 
 Dropping a bulk mutation future cancels active request streams and prevents new
 batches from starting.
@@ -572,6 +562,9 @@ Or call `ClientConfig::load()` to read these environment variables:
 
 Durations accept values such as `500ms`, `10s`, and `2m`.
 
+Production endpoints must use HTTPS. Emulator endpoints skip authentication;
+an omitted scheme defaults to HTTP, while an explicit HTTPS scheme enables TLS.
+
 ## Service limits
 
 The high-level API rejects inputs that exceed these hard Bigtable limits:
@@ -615,15 +608,15 @@ export BIGTABLE_INSTANCE_ID=test-instance
 export BIGTABLE_EMULATOR_HOST=127.0.0.1:8086
 ```
 
-Emulator connections use plaintext and skip authentication. The emulator is
-for local tests only.
+The official emulator uses plaintext and skips authentication. It is for local
+tests only.
 
 Run the end-to-end test with:
 
 ```bash
 RUN_BIGTABLE_EMULATOR_TESTS=1 \
 BIGTABLE_EMULATOR_HOST=127.0.0.1:8086 \
-cargo test --features emulator-tests --test emulator
+cargo test --locked --features emulator-tests --test emulator
 ```
 
 See the
@@ -636,59 +629,30 @@ Run the same checks used in CI:
 
 ```bash
 cargo fmt --all --check
-cargo check --workspace --all-targets --all-features
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets --all-features
-cargo test --workspace --all-targets --no-default-features
-cargo test --workspace --all-targets --all-features --release
-cargo test -p bigtable-client --lib --all-features --release \
+cargo check --locked --workspace --all-targets --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-targets --all-features
+cargo test --locked --workspace --doc --all-features
+cargo check --locked --workspace --all-targets --no-default-features
+cargo test --locked --workspace --all-targets --no-default-features
+cargo test --locked --workspace --all-targets --all-features --release
+cargo test --locked -p bigtable-client --lib --all-features --release \
   -- --ignored --test-threads=1
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
-cargo package -p bigtable-client-derive
-cargo package -p bigtable-client \
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps
+cargo package --locked -p bigtable-client-derive
+cargo package --locked -p bigtable-client \
   --config 'patch.crates-io.bigtable-client-derive.path="crates/bigtable-client-derive"'
 ```
 
-The M1 suite covers Google ReadRows chunk semantics, split cells across
-response messages, row resets, malformed streams, retry fault injection, scan
-markers, forward and reverse resume ranges, and deadline exhaustion.
+The tests cover chunk assembly, resets and malformed streams, forward and
+reverse resume ranges, deadlines, partial write retries, idempotency, bounded
+concurrency, typed mapping, compiler diagnostics, and observability. The serial
+tests exercise tracing and large read/write workloads. The separate emulator
+test above exercises the raw and high-level APIs, mapping, deletes, and
+concurrent reads from cloned clients.
 
-The M2 suite covers request count and byte splitting, bounded concurrency,
-atomic row changes, partial and streamed retry faults, rich status details,
-malformed response indexes, idempotency safety, cancellation, and live emulator
-writes and deletes.
-
-The M3 suite covers manual and derived mapping, sparse and default fields,
-binary qualifiers, JSON and custom decoders, generic structs, multiple cell
-versions, typed error locations, compiler diagnostics, typed streams, and live
-emulator reads.
-
-The M4 suite covers span hierarchy, Google-compatible metric names and
-attributes, request event order, retry summaries, deadlines, partial failures,
-cancellation, no-default-feature builds, and live emulator reads and writes.
-
-The M5 suite covers service limit validation, 10,000-row streams, cells split
-across thousands of messages, 10,000-entry partial retry workloads, packaged
-crate builds, and concurrent reads from cloned clients against the emulator.
-
-Every milestone must pass unit, public API, documentation, MSRV, release,
-package, and emulator tests before it is merged.
-
-## Roadmap
-
-- M0 complete: workspace, configuration, auth, channels, raw Tonic client,
-  emulator CI
-- M1 complete: row model, query builders, stream assembly, retry and deadline
-  policies
-- M2 complete: single-row and bulk mutations, bounded flow control, partial
-  retry handling
-- M3 complete: typed row mapping, derive support, custom decoders, and typed
-  streams
-- M4 complete: tracing spans, OpenTelemetry metrics, request diagnostics
-- M5 complete: compatibility review, stress tests, docs, and version `0.0.1`
-
-M5 prepares both packages for crates.io publication. Publishing remains a
-separate release action.
+Before merging, run the unit, public API, documentation, MSRV, release,
+package, and emulator checks. Publishing remains a separate release action.
 
 ## License
 
