@@ -27,6 +27,8 @@ const API_CLIENT_HEADER: &str = concat!(
     " gccl/",
     env!("CARGO_PKG_VERSION")
 );
+// Bigtable permits ReadRowsResponse messages up to 256 MiB.
+const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
 
 /// The generated Tonic Bigtable client with standard client metadata.
 pub type RawClient = BigtableClient<InterceptedService<Channel, AuthInterceptor>>;
@@ -435,7 +437,8 @@ impl Client {
         };
         let channel = channel::connect(&config).await?;
         let interceptor = AuthInterceptor::new(tokens)?;
-        let raw = BigtableClient::with_interceptor(channel, interceptor);
+        let raw = BigtableClient::with_interceptor(channel, interceptor)
+            .max_decoding_message_size(MAX_RESPONSE_BYTES);
 
         Ok(Self {
             inner: Arc::new(ClientInner {
