@@ -1,6 +1,6 @@
 use std::{
     fmt,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -18,7 +18,7 @@ const REFRESH_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 pub(crate) struct TokenManager {
     current: Arc<ArcSwap<TokenSnapshot>>,
-    refresh_task: Mutex<Option<JoinHandle<()>>>,
+    refresh_task: Option<JoinHandle<()>>,
 }
 
 impl TokenManager {
@@ -29,7 +29,7 @@ impl TokenManager {
 
         Ok(Arc::new(Self {
             current,
-            refresh_task: Mutex::new(Some(refresh_task)),
+            refresh_task: Some(refresh_task),
         }))
     }
 
@@ -53,7 +53,7 @@ impl TokenManager {
         )?));
         Ok(Arc::new(Self {
             current,
-            refresh_task: Mutex::new(None),
+            refresh_task: None,
         }))
     }
 }
@@ -69,9 +69,7 @@ impl fmt::Debug for TokenManager {
 
 impl Drop for TokenManager {
     fn drop(&mut self) {
-        if let Ok(mut task) = self.refresh_task.lock()
-            && let Some(task) = task.take()
-        {
+        if let Some(task) = self.refresh_task.take() {
             task.abort();
         }
     }
@@ -86,9 +84,10 @@ impl TryFrom<AccessToken> for TokenSnapshot {
     type Error = Error;
 
     fn try_from(token: AccessToken) -> Result<Self, Self::Error> {
-        let authorization = format!("Bearer {}", token.secret)
+        let mut authorization: MetadataValue<Ascii> = format!("Bearer {}", token.secret)
             .parse()
             .map_err(|source| Error::InvalidAccessToken { source })?;
+        authorization.set_sensitive(true);
         Ok(Self {
             authorization,
             expires_at: token.expires_at,
@@ -157,7 +156,14 @@ async fn refresh_loop(source: Arc<dyn TokenSource>, current: Arc<ArcSwap<TokenSn
         tokio::time::sleep(delay).await;
 
         match source.token().await.and_then(TokenSnapshot::try_from) {
-            Ok(token) => current.store(Arc::new(token)),
+            Ok(token) => {
+                let advanced_expiration = token.expires_at > current.load().expires_at;
+                current.store(Arc::new(token));
+                if !advanced_expiration {
+                    // Cached providers can return the same token inside the refresh margin.
+                    tokio::time::sleep(REFRESH_RETRY_DELAY).await;
+                }
+            }
             Err(error) => {
                 tracing::warn!(error = %error, "failed to refresh Bigtable access token");
                 tokio::time::sleep(REFRESH_RETRY_DELAY).await;
@@ -170,7 +176,10 @@ async fn refresh_loop(source: Arc<dyn TokenSource>, current: Arc<ArcSwap<TokenSn
 mod tests {
     use std::{
         collections::VecDeque,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, SystemTime},
     };
 
@@ -204,6 +213,9 @@ mod tests {
             manager.authorization().expect("current token"),
             "Bearer first"
         );
+        let authorization = manager.authorization().expect("current token");
+        assert!(authorization.is_sensitive());
+        assert!(!format!("{authorization:?}").contains("first"));
     }
 
     #[tokio::test]
@@ -221,6 +233,47 @@ mod tests {
         }
 
         panic!("token was not refreshed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unchanged_expiration_backs_off_and_stops_when_manager_drops() {
+        struct CachedTokenSource {
+            calls: AtomicUsize,
+            expires_at: SystemTime,
+        }
+
+        #[async_trait]
+        impl TokenSource for CachedTokenSource {
+            async fn token(&self) -> Result<AccessToken, Error> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(AccessToken {
+                    secret: "cached".to_owned(),
+                    expires_at: self.expires_at,
+                })
+            }
+        }
+
+        let source = Arc::new(CachedTokenSource {
+            calls: AtomicUsize::new(0),
+            expires_at: SystemTime::now() + Duration::from_secs(1),
+        });
+        let manager = TokenManager::start(source.clone())
+            .await
+            .expect("initial token");
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(source.calls.load(Ordering::Relaxed), 2);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(source.calls.load(Ordering::Relaxed), 3);
+
+        drop(manager);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(source.calls.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test(start_paused = true)]
