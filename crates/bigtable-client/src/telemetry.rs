@@ -369,6 +369,9 @@ impl OperationHandle {
         timeout: Duration,
     ) -> AttemptTracker {
         self.state.attempts.fetch_add(1, Ordering::Relaxed);
+        if attempt > 1 {
+            self.state.retries.fetch_add(1, Ordering::Relaxed);
+        }
         let span = tracing::info_span!(
             parent: &self.state.span,
             "bigtable.client.attempt",
@@ -415,7 +418,6 @@ impl OperationHandle {
         delay: Duration,
         pending_entries: usize,
     ) {
-        self.state.retries.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
             parent: &self.state.span,
             event = "retry.scheduled",
@@ -910,6 +912,33 @@ mod tests {
                 retries: 0,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn cancelling_a_scheduled_retry_does_not_count_an_unstarted_attempt() {
+        let (telemetry, events) = recorded_telemetry();
+        let operation = telemetry.operation(
+            &config(),
+            BigtableOperation::ReadRows,
+            "events".to_owned(),
+            0,
+        );
+        let handle = operation.handle();
+        let mut attempt = handle.attempt(None, 1, 0, Duration::from_secs(5));
+        attempt.finish(Code::Unavailable, AttemptSummary::default());
+        handle.retry(None, 1, Code::Unavailable, Duration::from_secs(1), 0);
+        drop(operation);
+
+        let events = events.lock().expect("diagnostics lock");
+        assert!(matches!(
+            events.last(),
+            Some(DiagnosticEvent::OperationFinished {
+                code: Code::Cancelled,
+                attempts: 1,
+                retries: 0,
+                ..
+            })
         ));
     }
 
