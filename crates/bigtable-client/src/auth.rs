@@ -144,19 +144,19 @@ impl TokenSource for GcpTokenSource {
 }
 
 async fn refresh_loop(source: Arc<dyn TokenSource>, current: Arc<ArcSwap<TokenSnapshot>>) {
-    let mut delay = refresh_delay(current.load().expires_at);
+    let mut delay = refresh_delay(current.load().expires_at, SystemTime::now());
     loop {
         tokio::time::sleep(delay).await;
 
         match source.token().await.and_then(TokenSnapshot::try_from) {
             Ok(token) => {
                 let advanced_expiration = token.expires_at > current.load().expires_at;
-                delay = refresh_delay(token.expires_at);
-                current.store(Arc::new(token));
+                let now = SystemTime::now();
+                delay = refresh_delay(token.expires_at, now);
                 if !advanced_expiration || delay.is_zero() {
-                    // Cached or expired tokens need a retry delay, even if expiry advances.
-                    delay = REFRESH_RETRY_DELAY;
+                    delay = refresh_retry_delay(token.expires_at, now);
                 }
+                current.store(Arc::new(token));
             }
             Err(error) => {
                 tracing::warn!(error = %error, "failed to refresh Bigtable access token");
@@ -166,12 +166,18 @@ async fn refresh_loop(source: Arc<dyn TokenSource>, current: Arc<ArcSwap<TokenSn
     }
 }
 
-fn refresh_delay(expires_at: SystemTime) -> Duration {
-    let remaining = expires_at
-        .duration_since(SystemTime::now())
-        .unwrap_or(Duration::ZERO);
+fn refresh_delay(expires_at: SystemTime, now: SystemTime) -> Duration {
+    let remaining = expires_at.duration_since(now).unwrap_or(Duration::ZERO);
     // Keep the standard margin for long-lived tokens and refresh short-lived tokens halfway.
     remaining - REFRESH_MARGIN.min(remaining / 2)
+}
+
+fn refresh_retry_delay(expires_at: SystemTime, now: SystemTime) -> Duration {
+    match expires_at.duration_since(now) {
+        // A caching provider may renew only at expiry; wait directly to that boundary.
+        Ok(remaining) if !remaining.is_zero() => REFRESH_RETRY_DELAY.min(remaining),
+        _ => REFRESH_RETRY_DELAY,
+    }
 }
 
 #[cfg(test)]
@@ -187,7 +193,7 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use super::{AccessToken, TokenManager, TokenSource};
+    use super::{AccessToken, TokenManager, TokenSource, refresh_retry_delay};
     use crate::Error;
 
     struct FakeTokenSource {
@@ -202,6 +208,20 @@ mod tests {
                 .expect("fake token lock should not be poisoned")
                 .pop_front()
                 .unwrap_or(Err(Error::ChannelPoolClosed))
+        }
+    }
+
+    #[test]
+    fn cached_retry_delay_caps_at_expiry_and_is_never_zero() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        for (expires_at, expected) in [
+            (now + Duration::from_secs(30), Duration::from_secs(5)),
+            (now + Duration::from_millis(500), Duration::from_millis(500)),
+            (now + Duration::from_nanos(1), Duration::from_nanos(1)),
+            (now, Duration::from_secs(5)),
+            (now - Duration::from_nanos(1), Duration::from_secs(5)),
+        ] {
+            assert_eq!(refresh_retry_delay(expires_at, now), expected);
         }
     }
 
@@ -274,6 +294,49 @@ mod tests {
             tokio::task::yield_now().await;
             assert_eq!(source.0.load(Ordering::Relaxed), expected_calls);
         }
+    }
+
+    #[tokio::test]
+    async fn cached_short_lived_token_refreshes_when_provider_renews_at_expiry() {
+        struct RenewAtExpiry {
+            expires_at: SystemTime,
+            cached_calls: AtomicUsize,
+            refreshed: tokio::sync::Notify,
+        }
+
+        #[async_trait]
+        impl TokenSource for RenewAtExpiry {
+            async fn token(&self) -> Result<AccessToken, Error> {
+                if SystemTime::now() < self.expires_at {
+                    self.cached_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(AccessToken {
+                        secret: "cached".to_owned(),
+                        expires_at: self.expires_at,
+                    })
+                } else {
+                    self.refreshed.notify_one();
+                    Ok(token("renewed", 3_600))
+                }
+            }
+        }
+
+        let source = Arc::new(RenewAtExpiry {
+            expires_at: SystemTime::now() + Duration::from_secs(1),
+            cached_calls: AtomicUsize::new(0),
+            refreshed: tokio::sync::Notify::new(),
+        });
+        let manager = TokenManager::start(source.clone())
+            .await
+            .expect("initial token");
+        tokio::time::timeout(Duration::from_secs(2), source.refreshed.notified())
+            .await
+            .expect("refresh follows expiry without a five-second gap");
+
+        assert!(source.cached_calls.load(Ordering::Relaxed) >= 2);
+        assert_eq!(
+            manager.authorization().expect("current token"),
+            "Bearer renewed"
+        );
     }
 
     #[tokio::test(start_paused = true)]
