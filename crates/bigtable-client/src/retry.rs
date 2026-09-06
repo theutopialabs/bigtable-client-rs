@@ -147,7 +147,9 @@ pub(crate) fn backoff(policy: &RetryPolicy, failed_attempt: u32) -> Duration {
     let factor = policy.multiplier.powi(exponent);
     let capped_seconds =
         (policy.initial_backoff.as_secs_f64() * factor).min(policy.max_backoff.as_secs_f64());
-    let capped = Duration::from_secs_f64(capped_seconds);
+    let capped = Duration::try_from_secs_f64(capped_seconds)
+        .unwrap_or(policy.max_backoff)
+        .min(policy.max_backoff);
 
     match policy.jitter {
         Jitter::None => capped,
@@ -236,6 +238,26 @@ mod tests {
         for _ in 0..100 {
             assert!(backoff(&policy, 1) <= policy.initial_backoff);
         }
+    }
+
+    #[test]
+    fn extreme_backoff_durations_saturate_without_panicking() {
+        let policy = RetryPolicy {
+            initial_backoff: std::time::Duration::MAX,
+            max_backoff: std::time::Duration::MAX,
+            jitter: Jitter::None,
+            ..RetryPolicy::default()
+        };
+
+        assert_eq!(backoff(&policy, 1), std::time::Duration::MAX);
+        assert_eq!(backoff(&policy, u32::MAX), std::time::Duration::MAX);
+        let rounded_limit = std::time::Duration::new(u64::MAX - 1, 123);
+        let policy = RetryPolicy {
+            initial_backoff: rounded_limit,
+            max_backoff: rounded_limit,
+            ..policy
+        };
+        assert_eq!(backoff(&policy, 1), rounded_limit);
     }
 
     #[test]
