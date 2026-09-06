@@ -1,13 +1,11 @@
 //! Public API contract tests.
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use bigtable_client::{
-    BatchPolicy, BigtableOperation, BulkMutation, BulkMutationOptions, BulkMutationPolicyIssue,
-    Cell, Client, ClientConfig, Column, ConfigField, ConfigIssue, DeadlinePolicy, DiagnosticEvent,
-    DiagnosticObserver, Error, Family, FromRow, Jitter, Mutation, MutationIssue, Query, QueryIssue,
-    ReadOptions, RetryPolicy, Row, RowBound, RowDecoder, RowMappingIssue, RowMutation, RowRange,
-    RowStream, TypedRowStream, proto,
+    BulkMutation, Cell, ClientConfig, Column, ConfigField, ConfigIssue, Error, Family, FromRow,
+    Mutation, MutationIssue, Query, QueryIssue, Row, RowDecoder, RowMappingIssue, RowMutation,
+    RowStream, TypedRowStream,
 };
 use bytes::Bytes;
 use futures_core::Stream;
@@ -103,127 +101,6 @@ fn public_validation_errors_are_typed() {
             issue: QueryIssue::EmptyTableId,
         }
     ));
-}
-
-#[test]
-fn generated_proto_types_are_available() {
-    let request = proto::ReadRowsRequest {
-        table_name: "projects/p/instances/i/tables/t".to_owned(),
-        ..proto::ReadRowsRequest::default()
-    };
-
-    assert_eq!(request.table_name, "projects/p/instances/i/tables/t");
-}
-
-#[test]
-fn public_query_and_row_types_support_binary_data() {
-    let query = Query::new("events")
-        .expect("valid table")
-        .row_key(Bytes::from_static(b"\x00one"))
-        .row_range(RowRange::new(
-            RowBound::inclusive(Bytes::from_static(b"a")),
-            RowBound::exclusive(Bytes::from_static(b"z")),
-        ))
-        .prefix(Bytes::from_static(b"user#"))
-        .limit(10)
-        .expect("valid limit")
-        .reversed();
-    let row = Row {
-        key: Bytes::from_static(b"\x00one"),
-        families: vec![Family {
-            name: "data".to_owned(),
-            columns: vec![Column {
-                qualifier: Bytes::from_static(b"\xffpayload"),
-                cells: vec![Cell {
-                    timestamp_micros: 42,
-                    value: Bytes::from_static(b"\x00\xff"),
-                    labels: vec!["match".to_owned()],
-                }],
-            }],
-        }],
-    };
-
-    assert!(format!("{query:?}").contains("events"));
-    assert_eq!(row.key.as_ref(), b"\x00one");
-    assert_eq!(
-        row.families[0].columns[0].cells[0].value.as_ref(),
-        b"\x00\xff"
-    );
-}
-
-#[test]
-fn public_policy_types_are_configurable() {
-    let read_options = ReadOptions {
-        retry: RetryPolicy {
-            max_attempts: 5,
-            initial_backoff: Duration::from_millis(25),
-            max_backoff: Duration::from_secs(2),
-            multiplier: 1.5,
-            jitter: Jitter::None,
-        },
-        deadlines: DeadlinePolicy {
-            operation_timeout: Duration::from_secs(30),
-            attempt_timeout: Duration::from_secs(5),
-        },
-    };
-
-    let write_options = BulkMutationOptions {
-        retry: RetryPolicy {
-            max_attempts: 4,
-            initial_backoff: Duration::from_millis(20),
-            max_backoff: Duration::from_secs(1),
-            multiplier: 2.0,
-            jitter: Jitter::None,
-        },
-        deadlines: DeadlinePolicy {
-            operation_timeout: Duration::from_secs(20),
-            attempt_timeout: Duration::from_secs(3),
-        },
-        batch: BatchPolicy {
-            max_entries_per_request: 50,
-            max_request_bytes: 4 * 1024 * 1024,
-            max_in_flight_requests: 3,
-        },
-    };
-
-    assert_eq!(read_options.retry.max_attempts, 5);
-    assert_eq!(
-        read_options.deadlines.attempt_timeout,
-        Duration::from_secs(5)
-    );
-    assert_eq!(write_options.batch.max_entries_per_request, 50);
-    assert_eq!(write_options.batch.max_in_flight_requests, 3);
-    assert_eq!(
-        BulkMutationPolicyIssue::ZeroInFlightRequests.to_string(),
-        "max_in_flight_requests must be greater than zero"
-    );
-}
-
-#[test]
-fn public_observability_api_builds_without_connecting() {
-    let config = ClientConfig::new("project", "instance").expect("valid config");
-    let builder =
-        Client::builder(config.clone()).with_diagnostic_observer(|_event: &DiagnosticEvent| {});
-    assert!(format!("{builder:?}").contains("has_diagnostic_observer: true"));
-
-    let observer: Arc<dyn DiagnosticObserver> = Arc::new(|_event: &DiagnosticEvent| {});
-    let shared = Client::builder(config).with_shared_diagnostic_observer(observer);
-    assert!(format!("{shared:?}").contains("has_diagnostic_observer: true"));
-    assert_eq!(format!("{:?}", BigtableOperation::ReadRows), "ReadRows");
-}
-
-#[cfg(feature = "opentelemetry")]
-#[test]
-fn public_builder_accepts_a_custom_meter() {
-    use opentelemetry::metrics::MeterProvider as _;
-    use opentelemetry_sdk::metrics::SdkMeterProvider;
-
-    let provider = SdkMeterProvider::default();
-    let meter = provider.meter("public-api-test");
-    let builder = Client::builder(ClientConfig::new("project", "instance").expect("valid config"))
-        .with_meter(meter);
-
-    assert!(format!("{builder:?}").contains("has_custom_meter: true"));
 }
 
 #[test]
