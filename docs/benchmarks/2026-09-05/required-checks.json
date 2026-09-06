@@ -1,0 +1,141 @@
+[
+  {
+    "check": "format",
+    "exit": 0,
+    "seconds": 0.09,
+    "summaries": []
+  },
+  {
+    "check": "check-all",
+    "exit": 0,
+    "seconds": 0.48,
+    "summaries": [
+      "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.46s"
+    ]
+  },
+  {
+    "check": "clippy",
+    "exit": 0,
+    "seconds": 0.96,
+    "summaries": [
+      "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.91s"
+    ]
+  },
+  {
+    "check": "test-all",
+    "exit": 0,
+    "seconds": 11.51,
+    "summaries": [
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.08s",
+      "test result: ok. 131 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 1.00s",
+      "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.12s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.71s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    ]
+  },
+  {
+    "check": "doctests",
+    "exit": 0,
+    "seconds": 2.51,
+    "summaries": [
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s",
+      "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    ]
+  },
+  {
+    "check": "check-no-default",
+    "exit": 0,
+    "seconds": 0.58,
+    "summaries": [
+      "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.55s"
+    ]
+  },
+  {
+    "check": "test-no-default",
+    "exit": 0,
+    "seconds": 8.17,
+    "summaries": [
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.48s",
+      "test result: ok. 130 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 1.00s",
+      "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.77s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.13s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    ]
+  },
+  {
+    "check": "doctests-no-default",
+    "exit": 0,
+    "seconds": 1.82,
+    "summaries": [
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s",
+      "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    ]
+  },
+  {
+    "check": "test-release",
+    "exit": 0,
+    "seconds": 10.18,
+    "summaries": [
+      "    Finished `release` profile [optimized] target(s) in 5.50s",
+      "test result: ok. 131 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 1.00s",
+      "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.56s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    ]
+  },
+  {
+    "check": "serial-stress",
+    "exit": 0,
+    "seconds": 3.09,
+    "summaries": [
+      "    Finished `release` profile [optimized] target(s) in 2.80s",
+      "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 131 filtered out; finished in 0.03s"
+    ]
+  },
+  {
+    "check": "rustdoc",
+    "exit": 0,
+    "seconds": 0.94,
+    "summaries": [
+      "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.91s"
+    ]
+  },
+  {
+    "check": "package-derive",
+    "exit": 0,
+    "seconds": 1.86,
+    "summaries": [
+      "    Packaged 7 files, 20.8KiB (6.4KiB compressed)",
+      "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.84s"
+    ]
+  },
+  {
+    "check": "package-client",
+    "exit": 0,
+    "seconds": 10.07,
+    "summaries": [
+      "    Packaged 47 files, 474.6KiB (95.6KiB compressed)",
+      "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.04s"
+    ]
+  },
+  {
+    "check": "emulator",
+    "exit": 0,
+    "seconds": 0.13,
+    "summaries": [
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s"
+    ]
+  }
+]

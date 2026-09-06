@@ -1,0 +1,79 @@
+{
+  "comparison_base": "2e8f220",
+  "production_prefixes_unchanged": [
+    "crates/bigtable-client/src/channel.rs",
+    "crates/bigtable-client/src/client.rs",
+    "crates/bigtable-client/src/config.rs",
+    "crates/bigtable-client/src/error.rs",
+    "crates/bigtable-client/src/mapping.rs",
+    "crates/bigtable-client/src/merge.rs",
+    "crates/bigtable-client/src/mutation.rs",
+    "crates/bigtable-client/src/query.rs",
+    "crates/bigtable-client/src/resource.rs",
+    "crates/bigtable-client/src/row.rs",
+    "crates/bigtable-client/src/write.rs"
+  ],
+  "test_case_counts": [
+    {
+      "file": "crates/bigtable-client/src/channel.rs",
+      "before": 4,
+      "after": 3
+    },
+    {
+      "file": "crates/bigtable-client/src/client.rs",
+      "before": 5,
+      "after": 5
+    },
+    {
+      "file": "crates/bigtable-client/src/config.rs",
+      "before": 12,
+      "after": 11
+    },
+    {
+      "file": "crates/bigtable-client/src/error.rs",
+      "before": 17,
+      "after": 14
+    },
+    {
+      "file": "crates/bigtable-client/src/mapping.rs",
+      "before": 9,
+      "after": 6
+    },
+    {
+      "file": "crates/bigtable-client/src/merge.rs",
+      "before": 13,
+      "after": 12
+    },
+    {
+      "file": "crates/bigtable-client/src/mutation.rs",
+      "before": 12,
+      "after": 11
+    },
+    {
+      "file": "crates/bigtable-client/src/query.rs",
+      "before": 8,
+      "after": 7
+    },
+    {
+      "file": "crates/bigtable-client/src/resource.rs",
+      "before": 2,
+      "after": 0
+    },
+    {
+      "file": "crates/bigtable-client/src/row.rs",
+      "before": 1,
+      "after": 0
+    },
+    {
+      "file": "crates/bigtable-client/src/write.rs",
+      "before": 25,
+      "after": 21
+    },
+    {
+      "file": "crates/bigtable-client/tests/public_api.rs",
+      "before": 16,
+      "after": 7
+    }
+  ],
+  "removed_test_cases": 27
+}

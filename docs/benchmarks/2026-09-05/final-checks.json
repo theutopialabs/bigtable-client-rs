@@ -1,0 +1,77 @@
+[
+  {
+    "check": "final-format",
+    "command": [
+      "cargo",
+      "+1.88.0",
+      "fmt",
+      "--all",
+      "--check"
+    ],
+    "exit": 0,
+    "seconds": 0.09,
+    "summaries": []
+  },
+  {
+    "check": "final-public-api-all",
+    "command": [
+      "cargo",
+      "+1.88.0",
+      "test",
+      "--locked",
+      "-p",
+      "bigtable-client",
+      "--test",
+      "public_api",
+      "--all-features"
+    ],
+    "exit": 0,
+    "seconds": 4.46,
+    "summaries": [
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.12s",
+      "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    ]
+  },
+  {
+    "check": "final-public-api-no-default",
+    "command": [
+      "cargo",
+      "+1.88.0",
+      "test",
+      "--locked",
+      "-p",
+      "bigtable-client",
+      "--test",
+      "public_api",
+      "--no-default-features"
+    ],
+    "exit": 0,
+    "seconds": 2.75,
+    "summaries": [
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.36s",
+      "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    ]
+  },
+  {
+    "check": "final-public-api-clippy",
+    "command": [
+      "cargo",
+      "+1.88.0",
+      "clippy",
+      "--locked",
+      "-p",
+      "bigtable-client",
+      "--test",
+      "public_api",
+      "--all-features",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit": 0,
+    "seconds": 3.03,
+    "summaries": [
+      "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.95s"
+    ]
+  }
+]

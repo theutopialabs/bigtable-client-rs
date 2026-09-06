@@ -1,0 +1,55 @@
+{
+  "runs": 90,
+  "cases": 10,
+  "clients": 3,
+  "replicates": 3,
+  "run_scope": "90 retained matrix trial results; archived incomplete attempts are excluded.",
+  "archived_incomplete_attempt_traces": [
+    "attempts/stress-soak-rep1-durch-initial.stderr"
+  ],
+  "all_available_preflight_and_postflight_or_recovery_hashes_match": true,
+  "process_timeouts": 1,
+  "available_timing_runs": 90,
+  "unavailable_timing_runs": 0,
+  "verified_recovery_hashes": 8,
+  "counter_scope": "Only runs with final measured JSON; missing counters are unknown, not zero.",
+  "operations": 3141349,
+  "completed_operations": 2525413,
+  "operation_errors": 404834,
+  "data_errors": 0,
+  "dropped": 211102,
+  "postverify_transport_recoveries": 8,
+  "emulator_stats_samples": 7547,
+  "by_client": {
+    "ours": {
+      "available_timing_runs": 30,
+      "unavailable_timing_runs": 0,
+      "process_timeouts": 0,
+      "offered": 1156877,
+      "completed": 1156839,
+      "errors": 0,
+      "data_errors": 0,
+      "dropped": 38
+    },
+    "liufuyang": {
+      "available_timing_runs": 30,
+      "unavailable_timing_runs": 0,
+      "process_timeouts": 0,
+      "offered": 1157593,
+      "completed": 1157547,
+      "errors": 0,
+      "data_errors": 0,
+      "dropped": 46
+    },
+    "durch": {
+      "available_timing_runs": 30,
+      "unavailable_timing_runs": 0,
+      "process_timeouts": 1,
+      "offered": 826879,
+      "completed": 211027,
+      "errors": 404834,
+      "data_errors": 0,
+      "dropped": 211018
+    }
+  }
+}
