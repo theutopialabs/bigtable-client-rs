@@ -144,32 +144,34 @@ impl TokenSource for GcpTokenSource {
 }
 
 async fn refresh_loop(source: Arc<dyn TokenSource>, current: Arc<ArcSwap<TokenSnapshot>>) {
+    let mut delay = refresh_delay(current.load().expires_at);
     loop {
-        let refresh_at = current
-            .load()
-            .expires_at
-            .checked_sub(REFRESH_MARGIN)
-            .unwrap_or(SystemTime::now());
-        let delay = refresh_at
-            .duration_since(SystemTime::now())
-            .unwrap_or(Duration::ZERO);
         tokio::time::sleep(delay).await;
 
         match source.token().await.and_then(TokenSnapshot::try_from) {
             Ok(token) => {
                 let advanced_expiration = token.expires_at > current.load().expires_at;
+                delay = refresh_delay(token.expires_at);
                 current.store(Arc::new(token));
-                if !advanced_expiration {
-                    // Cached providers can return the same token inside the refresh margin.
-                    tokio::time::sleep(REFRESH_RETRY_DELAY).await;
+                if !advanced_expiration || delay.is_zero() {
+                    // Cached or expired tokens need a retry delay, even if expiry advances.
+                    delay = REFRESH_RETRY_DELAY;
                 }
             }
             Err(error) => {
                 tracing::warn!(error = %error, "failed to refresh Bigtable access token");
-                tokio::time::sleep(REFRESH_RETRY_DELAY).await;
+                delay = REFRESH_RETRY_DELAY;
             }
         }
     }
+}
+
+fn refresh_delay(expires_at: SystemTime) -> Duration {
+    let remaining = expires_at
+        .duration_since(SystemTime::now())
+        .unwrap_or(Duration::ZERO);
+    // Keep the standard margin for long-lived tokens and refresh short-lived tokens halfway.
+    remaining - REFRESH_MARGIN.min(remaining / 2)
 }
 
 #[cfg(test)]
@@ -218,21 +220,60 @@ mod tests {
         assert!(!format!("{authorization:?}").contains("first"));
     }
 
-    #[tokio::test]
-    async fn manager_refreshes_before_expiry() {
-        let manager = TokenManager::start(fake_source([token("first", 1), token("second", 3_600)]))
-            .await
-            .expect("valid token");
-        let expected = "Bearer second".parse().expect("valid metadata");
+    #[tokio::test(start_paused = true)]
+    async fn manager_refreshes_long_lived_tokens_at_standard_margin() {
+        let manager =
+            TokenManager::start(fake_source([token("first", 3_600), token("second", 7_200)]))
+                .await
+                .expect("valid token");
 
-        for _ in 0..100 {
-            if manager.authorization().ok().as_ref() == Some(&expected) {
-                return;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(3_584)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            manager.authorization().expect("current token"),
+            "Bearer first"
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            manager.authorization().expect("refreshed token"),
+            "Bearer second"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn advancing_short_lived_tokens_wait_between_refreshes() {
+        struct ShortLivedTokenSource(AtomicUsize);
+
+        #[async_trait]
+        impl TokenSource for ShortLivedTokenSource {
+            async fn token(&self) -> Result<AccessToken, Error> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(token("short-lived", 1))
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
-        panic!("token was not refreshed");
+        let source = Arc::new(ShortLivedTokenSource(AtomicUsize::new(0)));
+        let _manager = TokenManager::start(source.clone())
+            .await
+            .expect("initial token");
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(source.0.load(Ordering::Relaxed), 1);
+
+        // Pausing Tokio does not advance SystemTime: every fetched token still
+        // has about one real second remaining, so each refresh waits about half a second.
+        for expected_calls in 2..=3 {
+            tokio::time::advance(Duration::from_millis(600)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(source.0.load(Ordering::Relaxed), expected_calls);
+            tokio::time::advance(Duration::from_millis(20)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(source.0.load(Ordering::Relaxed), expected_calls);
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -265,6 +306,9 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
+        assert_eq!(source.calls.load(Ordering::Relaxed), 1);
+        tokio::time::advance(Duration::from_millis(600)).await;
+        tokio::task::yield_now().await;
         assert_eq!(source.calls.load(Ordering::Relaxed), 2);
         tokio::time::advance(Duration::from_secs(5)).await;
         tokio::task::yield_now().await;
@@ -285,18 +329,47 @@ mod tests {
         ]))
         .await
         .expect("initial token is valid");
-        let expected = "Bearer recovered".parse().expect("valid metadata");
 
         tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(600)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            manager.authorization().expect("cached token"),
+            "Bearer first"
+        );
         tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            manager.authorization().expect("refreshed token"),
+            "Bearer recovered"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn advancing_but_expired_tokens_wait_before_retrying() {
+        let expired = |seconds| AccessToken {
+            secret: "expired".to_owned(),
+            expires_at: SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+        };
+        let manager = TokenManager::start(fake_source([
+            expired(0),
+            expired(1),
+            token("recovered", 3_600),
+        ]))
+        .await
+        .expect("valid metadata");
         for _ in 0..20 {
-            if manager.authorization().ok().as_ref() == Some(&expected) {
-                return;
-            }
+            tokio::time::advance(Duration::from_millis(1)).await;
             tokio::task::yield_now().await;
         }
+        assert!(manager.authorization().is_err());
 
-        panic!("token refresh did not recover");
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            manager.authorization().expect("refreshed token"),
+            "Bearer recovered"
+        );
     }
 
     #[tokio::test]
