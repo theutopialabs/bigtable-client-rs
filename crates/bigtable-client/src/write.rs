@@ -669,6 +669,7 @@ impl BatchOperation {
                 outcome.failures.push(MutationFailure {
                     index: entry.original_index,
                     attempts: entry.attempts,
+                    retry_safe: entry.retry_safe,
                     cause: MutationFailureCause::InvalidResponse {
                         issue: MutateRowsResponseIssue::MissingIndex { index: local_index },
                     },
@@ -691,6 +692,7 @@ impl BatchOperation {
                 .map(|entry| MutationFailure {
                     index: entry.original_index,
                     attempts: entry.attempts,
+                    retry_safe: entry.retry_safe,
                     cause: MutationFailureCause::InvalidResponse {
                         issue: issue.clone(),
                     },
@@ -738,12 +740,13 @@ impl BatchOperation {
             outcome.code = status.code();
         }
         let cause = match origin {
-            FailureOrigin::Entry => MutationFailureCause::EntryStatus { status, retry_safe },
-            FailureOrigin::Rpc => MutationFailureCause::RpcStatus { status, retry_safe },
+            FailureOrigin::Entry => MutationFailureCause::EntryStatus { status },
+            FailureOrigin::Rpc => MutationFailureCause::RpcStatus { status },
         };
         outcome.failures.push(MutationFailure {
             index: entry.original_index,
             attempts: entry.attempts,
+            retry_safe,
             cause,
         });
     }
@@ -753,6 +756,7 @@ impl BatchOperation {
             .extend(self.pending.drain(..).map(|entry| MutationFailure {
                 index: entry.original_index,
                 attempts: entry.attempts,
+                retry_safe: entry.retry_safe,
                 cause: MutationFailureCause::DeadlineExceeded {
                     timeout: self.options.deadlines.operation_timeout,
                 },
@@ -1455,12 +1459,10 @@ mod tests {
 
         assert_eq!(error.successful_entries(), 1);
         assert_eq!(error.failures()[0].index(), 1);
+        assert!(!error.failures()[0].retry_safe());
         assert!(matches!(
             error.failures()[0].cause(),
-            MutationFailureCause::RpcStatus {
-                status,
-                retry_safe: false
-            } if status.code() == Code::Unavailable
+            MutationFailureCause::RpcStatus { status } if status.code() == Code::Unavailable
         ));
         let requests = service.requests.lock().await;
         assert_eq!(requests.len(), 2);
@@ -1561,6 +1563,7 @@ mod tests {
             MutationFailureCause::DeadlineExceeded { timeout }
                 if *timeout == Duration::from_millis(1_500)
         ));
+        assert!(error.failures()[0].retry_safe());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1603,6 +1606,7 @@ mod tests {
                 error.failures()[0].cause(),
                 MutationFailureCause::InvalidResponse { issue } if *issue == expected
             ));
+            assert!(error.failures()[0].retry_safe());
             assert_eq!(service.requests.lock().await.len(), 1);
         }
     }
@@ -1633,6 +1637,7 @@ mod tests {
                 issue: MutateRowsResponseIssue::MissingIndex { index: 1 }
             }
         ));
+        assert!(error.failures()[0].retry_safe());
     }
 
     #[tokio::test(start_paused = true)]

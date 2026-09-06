@@ -466,8 +466,6 @@ pub enum MutationFailureCause {
         /// The entry status, including rich status details when present.
         #[source]
         status: tonic::Status,
-        /// Whether replaying the entry is idempotent.
-        retry_safe: bool,
     },
     /// The RPC ended before this entry received a result.
     #[error("mutation result was interrupted: {status}")]
@@ -475,8 +473,6 @@ pub enum MutationFailureCause {
         /// The RPC status.
         #[source]
         status: tonic::Status,
-        /// Whether replaying the entry is idempotent.
-        retry_safe: bool,
     },
     /// The operation deadline ended before this entry completed.
     #[error("mutation exceeded the {timeout:?} operation deadline")]
@@ -501,17 +497,6 @@ impl MutationFailureCause {
             Self::DeadlineExceeded { .. } | Self::InvalidResponse { .. } => None,
         }
     }
-
-    /// Returns whether replaying the entry is idempotent.
-    #[must_use]
-    pub const fn retry_safe(&self) -> bool {
-        match self {
-            Self::EntryStatus { retry_safe, .. } | Self::RpcStatus { retry_safe, .. } => {
-                *retry_safe
-            }
-            Self::DeadlineExceeded { .. } | Self::InvalidResponse { .. } => false,
-        }
-    }
 }
 
 /// One failed entry from the original bulk mutation.
@@ -519,6 +504,7 @@ impl MutationFailureCause {
 pub struct MutationFailure {
     pub(crate) index: usize,
     pub(crate) attempts: u32,
+    pub(crate) retry_safe: bool,
     pub(crate) cause: MutationFailureCause,
 }
 
@@ -533,6 +519,12 @@ impl MutationFailure {
     #[must_use]
     pub const fn attempts(&self) -> u32 {
         self.attempts
+    }
+
+    /// Returns whether replaying the entry is idempotent.
+    #[must_use]
+    pub const fn retry_safe(&self) -> bool {
+        self.retry_safe
     }
 
     /// Returns why the entry lacks a confirmed success.
@@ -892,9 +884,9 @@ mod tests {
             failures: vec![MutationFailure {
                 index: 1,
                 attempts: 2,
+                retry_safe: true,
                 cause: MutationFailureCause::EntryStatus {
                     status: tonic::Status::invalid_argument("bad cell"),
-                    retry_safe: true,
                 },
             }],
         };
@@ -904,7 +896,7 @@ mod tests {
         assert_eq!(error.rpc_attempts(), 3);
         assert_eq!(error.failures()[0].index(), 1);
         assert_eq!(error.failures()[0].attempts(), 2);
-        assert!(error.failures()[0].cause().retry_safe());
+        assert!(error.failures()[0].retry_safe());
         assert_eq!(
             error.failures()[0]
                 .cause()
@@ -1061,6 +1053,10 @@ mod tests {
             (
                 ConfigIssue::InvalidUri,
                 "must be an absolute HTTP or HTTPS URI",
+            ),
+            (
+                ConfigIssue::HttpsRequired,
+                "must use HTTPS for authenticated requests",
             ),
             (ConfigIssue::MustBePositive, "must be greater than zero"),
         ];
