@@ -25,6 +25,7 @@ use crate::{
     merge::RowMerger,
     proto::{
         ReadRowsRequest, ReadRowsResponse, RowSet,
+        read_rows_response::cell_chunk::RowStatus,
         row_range::{EndKey, StartKey},
     },
     retry,
@@ -202,6 +203,12 @@ enum OpenResult {
     Cancelled,
 }
 
+enum ResponseOutcome {
+    Continue,
+    Cancelled,
+    AttemptDeadlineExceeded,
+}
+
 impl ReadOperation {
     fn new(
         service: Arc<dyn ReadRowsService>,
@@ -247,23 +254,35 @@ impl ReadOperation {
                 Ok(Some(Ok(response))) => {
                     active.telemetry.first_response();
                     let before = self.rows_returned;
-                    let result = self.handle_response(response, &sender).await;
+                    let result = self
+                        .handle_response(response, &sender, active.deadline)
+                        .await;
                     active.rows = active.rows.saturating_add(
                         u64::try_from(self.rows_returned.saturating_sub(before))
                             .unwrap_or(u64::MAX),
                     );
                     match result {
-                        Ok(true) => {
+                        Ok(ResponseOutcome::Continue) => {
                             if self.limit_reached() {
                                 active.finish(Code::Ok);
                                 self.finish(Code::Ok);
                                 return;
                             }
                         }
-                        Ok(false) => {
+                        Ok(ResponseOutcome::Cancelled) => {
                             active.finish(Code::Cancelled);
                             self.finish(Code::Cancelled);
                             return;
+                        }
+                        Ok(ResponseOutcome::AttemptDeadlineExceeded) => {
+                            active.finish(Code::DeadlineExceeded);
+                            drop(active);
+                            let status =
+                                Status::deadline_exceeded("ReadRows attempt deadline exceeded");
+                            let Some(next_attempt) = self.reopen(status, &sender).await else {
+                                return;
+                            };
+                            active = next_attempt;
                         }
                         Err(error) => {
                             let code = if matches!(error, Error::ReadDeadlineExceeded { .. }) {
@@ -293,29 +312,19 @@ impl ReadOperation {
                 Ok(Some(Err(status))) => {
                     active.finish(status.code());
                     drop(active);
-                    self.merger.discard_partial();
-                    match self.open(Some(status), Some(&sender)).await {
-                        Ok(OpenResult::Active(next_attempt)) => active = next_attempt,
-                        Ok(OpenResult::Complete | OpenResult::Cancelled) => return,
-                        Err(error) => {
-                            send_terminal(&sender, error).await;
-                            return;
-                        }
-                    }
+                    let Some(next_attempt) = self.reopen(status, &sender).await else {
+                        return;
+                    };
+                    active = next_attempt;
                 }
                 Err(_) => {
                     active.finish(Code::DeadlineExceeded);
                     drop(active);
-                    self.merger.discard_partial();
                     let status = Status::deadline_exceeded("ReadRows attempt deadline exceeded");
-                    match self.open(Some(status), Some(&sender)).await {
-                        Ok(OpenResult::Active(next_attempt)) => active = next_attempt,
-                        Ok(OpenResult::Complete | OpenResult::Cancelled) => return,
-                        Err(error) => {
-                            send_terminal(&sender, error).await;
-                            return;
-                        }
-                    }
+                    let Some(next_attempt) = self.reopen(status, &sender).await else {
+                        return;
+                    };
+                    active = next_attempt;
                 }
             }
         }
@@ -325,7 +334,8 @@ impl ReadOperation {
         &mut self,
         response: ReadRowsResponse,
         sender: &mpsc::Sender<Result<Row, Error>>,
-    ) -> Result<bool, Error> {
+        attempt_deadline: Instant,
+    ) -> Result<ResponseOutcome, Error> {
         if !response.last_scanned_row_key.is_empty() {
             self.merger
                 .scan_marker(response.last_scanned_row_key.clone())
@@ -334,26 +344,59 @@ impl ReadOperation {
         }
 
         for chunk in response.chunks {
-            if Instant::now() >= self.deadline {
+            let now = Instant::now();
+            if now >= self.deadline {
                 return Err(self.deadline_error());
             }
+            if now >= attempt_deadline {
+                return Ok(ResponseOutcome::AttemptDeadlineExceeded);
+            }
+            let permit = if matches!(chunk.row_status.as_ref(), Some(RowStatus::CommitRow(true))) {
+                let blocked = Instant::now();
+                let permit =
+                    timeout_at(attempt_deadline.min(self.deadline), sender.reserve()).await;
+                self.telemetry().application_blocked(blocked.elapsed());
+                match permit {
+                    Ok(Ok(permit)) => Some(permit),
+                    Ok(Err(_)) => return Ok(ResponseOutcome::Cancelled),
+                    Err(_) if Instant::now() >= self.deadline => {
+                        return Err(self.deadline_error());
+                    }
+                    Err(_) => return Ok(ResponseOutcome::AttemptDeadlineExceeded),
+                }
+            } else {
+                None
+            };
             if let Some(row) = self
                 .merger
                 .push(&chunk)
                 .map_err(|issue| Error::InvalidReadRowsResponse { issue })?
             {
                 let key = row.key.clone();
-                let blocked = Instant::now();
-                let sent = timeout_at(self.deadline, sender.send(Ok(row))).await;
-                self.telemetry().application_blocked(blocked.elapsed());
-                if sent.map_err(|_| self.deadline_error())?.is_err() {
-                    return Ok(false);
-                }
+                permit
+                    .expect("a committed row reserves delivery capacity")
+                    .send(Ok(row));
                 self.rows_returned += 1;
                 self.progress = Some(key);
             }
         }
-        Ok(true)
+        Ok(ResponseOutcome::Continue)
+    }
+
+    async fn reopen(
+        &mut self,
+        status: Status,
+        sender: &mpsc::Sender<Result<Row, Error>>,
+    ) -> Option<ActiveAttempt> {
+        self.merger.discard_partial();
+        match self.open(Some(status), Some(sender)).await {
+            Ok(OpenResult::Active(active)) => Some(active),
+            Ok(OpenResult::Complete | OpenResult::Cancelled) => None,
+            Err(error) => {
+                send_terminal(sender, error).await;
+                None
+            }
+        }
     }
 
     async fn open(
@@ -1093,6 +1136,85 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn attempt_deadline_releases_backpressured_rpc_and_resumes_undelivered_row() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let first_attempt = (0..=super::STREAM_BUFFER)
+            .map(|index| {
+                Ok(owned_row_response(
+                    Bytes::from(format!("row-{index:03}")),
+                    Bytes::new(),
+                ))
+            })
+            .collect();
+        let second_attempt = (super::STREAM_BUFFER..=super::STREAM_BUFFER + 1)
+            .map(|index| {
+                Ok(owned_row_response(
+                    Bytes::from(format!("row-{index:03}")),
+                    Bytes::new(),
+                ))
+            })
+            .collect();
+        let service = Arc::new(FakeService::new([
+            Script::BufferedDrop(first_attempt, dropped.clone()),
+            Script::Stream(second_attempt),
+        ]));
+        let (telemetry, events) = recorded_telemetry();
+        let mut stream = start_with_service_and_telemetry(
+            service.clone(),
+            &config(),
+            telemetry,
+            Query::new("table").expect("query"),
+            options(),
+        )
+        .await
+        .expect("read starts");
+        tokio::task::yield_now().await;
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "attempt deadline must release the active RPC"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+
+        let mut keys = Vec::new();
+        while let Some(row) = stream.next().await {
+            keys.push(row.expect("complete row").key);
+        }
+        let expected = (0..=super::STREAM_BUFFER + 1)
+            .map(|index| Bytes::from(format!("row-{index:03}")))
+            .collect::<Vec<_>>();
+        assert_eq!(keys, expected);
+
+        let requests = service.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1]
+                .rows
+                .as_ref()
+                .expect("resumed row set")
+                .row_ranges[0]
+                .start_key,
+            Some(StartKey::StartKeyOpen(Bytes::from_static(b"row-015")))
+        );
+        drop(requests);
+        let events = events.lock().expect("events");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DiagnosticEvent::OperationFinished {
+                code: Code::Ok,
+                attempts: 2,
+                retries: 1,
+                rows: 18,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn operation_deadline_releases_rpc_while_row_buffer_is_full() {
         let dropped = Arc::new(AtomicBool::new(false));
         let items = (0..=super::STREAM_BUFFER)
@@ -1108,12 +1230,14 @@ mod tests {
             dropped.clone(),
         )]));
         let (telemetry, events) = recorded_telemetry();
+        let mut deadline_options = options();
+        deadline_options.deadlines.attempt_timeout = Duration::from_secs(20);
         let mut stream = start_with_service_and_telemetry(
             service,
             &config(),
             telemetry,
             Query::new("table").expect("query"),
-            options(),
+            deadline_options,
         )
         .await
         .expect("read starts");
